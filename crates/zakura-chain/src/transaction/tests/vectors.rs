@@ -2331,7 +2331,7 @@ fn assert_noncanonical_shielded_protocol_proof_size(error: SerializationError) {
 /// pattern.
 #[test]
 fn orchard_rk_identity_point_rejected_during_deserialization() {
-    use group::prime::PrimeCurveAffine;
+    use group::CurveAffine;
     use reddsa::Signature;
 
     use crate::{
@@ -2803,8 +2803,8 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
 
         let unmined = UnminedTx::from(parsed.clone());
         let (txid, auth_digest) = parsed.txid_and_auth_digest();
-        assert_eq!(unmined.id.mined_id(), txid);
-        assert_eq!(unmined.id.auth_digest(), auth_digest);
+        assert_eq!(unmined.id().mined_id(), txid);
+        assert_eq!(unmined.id().auth_digest(), auth_digest);
         assert_ne!(
             txid,
             changed_parsed.hash(),

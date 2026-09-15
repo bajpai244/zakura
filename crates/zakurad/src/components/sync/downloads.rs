@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 use tower::{hedge, Service, ServiceExt};
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     block::{self, Height, HeightDiff},
@@ -31,11 +31,15 @@ use zakura_chain::{
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
-use crate::components::sync::{
-    legacy_trace::{
-        LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
+use crate::components::{
+    auth_download_height::tip_child_mismatch,
+    sync::{
+        legacy_trace::{
+            LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
+        },
+        BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
+        FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
-    FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -121,6 +125,23 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
+    /// A downloaded block claims our best tip as its parent, but its coinbase height is not
+    /// one above the tip height.
+    ///
+    /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
+    /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
+    /// canonical body without changing the requested hash. A tip child's real height is known
+    /// from our own committed tip, so a mismatch is definitively a poisoned body.
+    #[error(
+        "downloaded tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}"
+    )]
+    TipChildHeightMismatch {
+        height: block::Height,
+        expected_height: block::Height,
+        hash: block::Hash,
+        advertiser_addr: Option<PeerSocketAddr>,
+    },
+
     #[error("downloaded block had an invalid height: {hash:?}")]
     InvalidHeight {
         hash: block::Hash,
@@ -196,6 +217,9 @@ impl BlockDownloadVerifyError {
     pub(super) fn advertiser_addr(&self) -> Option<PeerSocketAddr> {
         match self {
             Self::AboveLookaheadHeightLimit {
+                advertiser_addr, ..
+            }
+            | Self::TipChildHeightMismatch {
                 advertiser_addr, ..
             }
             | Self::InvalidHeight {
@@ -483,9 +507,9 @@ where
 
     /// Queue a block for download and verification.
     ///
-    /// This method waits for the network to become ready, and returns an error
-    /// only if the network service fails. It returns immediately after queuing
-    /// the request.
+    /// This method waits up to [`BLOCK_DOWNLOAD_TIMEOUT`] for the network to become ready. It
+    /// returns an error if readiness fails or times out. It returns immediately after queuing the
+    /// request.
     #[instrument(level = "debug", skip(self), fields(%hash))]
     pub async fn download_and_verify(
         &mut self,
@@ -511,13 +535,20 @@ where
         // if we waited for readiness and did the service call in the spawned
         // tasks, all of the spawned tasks would race each other waiting for the
         // network to become ready.
-        let network = match self.network.ready().await {
-            Ok(network) => network,
-            Err(error) => {
+        let network = match timeout(BLOCK_DOWNLOAD_TIMEOUT, self.network.ready()).await {
+            Ok(Ok(network)) => network,
+            Ok(Err(error)) => {
                 let state = take_task_state(&self.task_states, hash);
                 self.trace
                     .block_finish(hash, LegacyBlockOutcome::Error(&error), state);
                 return Err(BlockDownloadVerifyError::NetworkServiceError { error });
+            }
+            Err(error) => {
+                let error = BlockDownloadVerifyError::from(error);
+                let state = take_task_state(&self.task_states, hash);
+                self.trace
+                    .block_finish(hash, LegacyBlockOutcome::Error(&error), state);
+                return Err(error);
             }
         };
         let block_req = network.call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
@@ -614,6 +645,12 @@ where
                 // that will timeout before being verified.
                 let tip_height = latest_chain_tip.best_tip_height();
 
+                // Read separately from `tip_height`, and used only by the new tip-child height
+                // check below. Deriving `tip_height` from this pair instead would couple the
+                // existing lookahead and behind-tip policies to hash availability: a chain tip
+                // reporting a height but not yet a hash would fall into the no-tip regime.
+                let best_tip = latest_chain_tip.best_tip_height_and_hash();
+
                 let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) = if let Some(tip_height) = tip_height {
                     // Scale the height limit with the lookahead limit,
                     // so users with low capacity or under DoS can reduce them both.
@@ -662,6 +699,32 @@ where
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
+
+                // Security: authenticate the claimed coinbase height against our own tip before
+                // any height-based policy runs below. Otherwise `min_accepted_height` would
+                // discard a height-rewritten body as a benign old block: unattributed,
+                // unscored, and not requeued. See `crate::components::auth_download_height`.
+                if let Some(expected_height) = tip_child_mismatch(
+                    block.header.previous_block_hash,
+                    block_height,
+                    best_tip,
+                ) {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        ?expected_height,
+                        "tip child claimed the wrong coinbase height: rejected poisoned block"
+                    );
+                    metrics::counter!("sync.tip.child.height.mismatch.count").increment(1);
+
+                    return Err(BlockDownloadVerifyError::TipChildHeightMismatch {
+                        height: block_height,
+                        expected_height,
+                        hash,
+                        advertiser_addr,
+                    });
+                }
+
                 trace.block_downloaded(
                     hash,
                     block_height,
@@ -859,6 +922,21 @@ where
     /// Get the number of currently in-flight download and verify tasks.
     pub fn in_flight(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Returns the hashes and known heights of all pending tasks.
+    ///
+    /// The downloader learns a task's height after it downloads the block body.
+    pub(super) fn pending_hash_heights(&self) -> HashMap<block::Hash, Option<Height>> {
+        let states = self
+            .task_states
+            .lock()
+            .expect("legacy task state lock is only held for synchronous updates");
+
+        self.cancel_handles
+            .keys()
+            .map(|hash| (*hash, states.get(hash).and_then(|state| state.height)))
+            .collect()
     }
 
     /// Returns true if there are no in-flight download and verify tasks.

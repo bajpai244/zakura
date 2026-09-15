@@ -17,21 +17,24 @@ use std::{
     io,
 };
 
-use bitvec::prelude::*;
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
-use incrementalmerkletree::{frontier::NonEmptyFrontier, Hashable};
+use incrementalmerkletree::{
+    frontier::{Frontier, NonEmptyFrontier},
+    Hashable,
+};
 use lazy_static::lazy_static;
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
 
-use sinsemilla::HashDomain;
+use sinsemilla::{weighted::UncheckedFixedLengthHashDomain, HashDomain, K};
 
 use crate::{
     serialization::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
+    subtree_verify::{self, SubtreeRootsError},
 };
 
 pub mod legacy;
@@ -44,15 +47,42 @@ pub type NoteCommitmentUpdate = pallas::Base;
 
 pub(super) const MERKLE_DEPTH: u8 = 32;
 
+/// Bits in one Merkle child encoding: a 255-bit little-endian Pallas base
+/// field element (`l_MerkleOrchard` in the protocol spec).
+const L_ORCHARD_MERKLE: usize = 255;
+/// Bits in one `MerkleCRH^Orchard` message: the 10-bit layer prefix followed
+/// by the left and right child encodings.
+const MERKLE_CRH_BITS: usize = K + 2 * L_ORCHARD_MERKLE;
+/// `MerkleCRH^Orchard` inputs always fill this many Sinsemilla words exactly,
+/// which is what lets the fixed-length weighted evaluator apply.
+const MERKLE_CRH_WORDS: usize = MERKLE_CRH_BITS / K;
+const _: () = assert!(MERKLE_CRH_BITS.is_multiple_of(K));
+/// Complete Sinsemilla words in one 255-bit child encoding.
+const MERKLE_CRH_FULL_CHILD_WORDS: usize = L_ORCHARD_MERKLE / K;
+/// Bits left after decoding a child's complete Sinsemilla words.
+const MERKLE_CRH_CHILD_REMAINDER_BITS: usize = L_ORCHARD_MERKLE % K;
+/// Index of the word spanning the left and right child encodings.
+const MERKLE_CRH_CROSS_CHILD_WORD: usize = 1 + MERKLE_CRH_FULL_CHILD_WORDS;
+const SINSEMILLA_WORD_MASK: u16 = (1 << K) - 1;
+const CHILD_REMAINDER_MASK: u8 = (1 << MERKLE_CRH_CHILD_REMAINDER_BITS) - 1;
+const BYTE_BITS: usize = u8::BITS as usize;
+
 lazy_static! {
-    /// The Sinsemilla hash domain for `MerkleCRH^Orchard`.
+    /// The position-weighted Sinsemilla evaluator for `MerkleCRH^Orchard`,
+    /// specialized to the fixed 52-word `l || left || right` message layout.
     ///
-    /// The domain's `Q` generator is derived once (via `hash_to_curve` of the
-    /// constant domain string) and reused for every node hash. Constructing a
-    /// fresh [`HashDomain`] per hash would recompute that `hash_to_curve` on the
-    /// hot path, which is pure waste since the domain never changes.
-    static ref ORCHARD_MERKLE_CRH_DOMAIN: HashDomain =
-        HashDomain::new("z.cash:Orchard-MerkleCRH");
+    /// Built once from the `"z.cash:Orchard-MerkleCRH"` [`HashDomain`]. Its
+    /// precomputed per-position generator table (a few MiB on the heap, see
+    /// [`UncheckedFixedLengthHashDomain::table_bytes`]) replaces the
+    /// doubling recurrence with table lookups and point additions, and omits
+    /// Sinsemilla's incomplete-addition exceptional-case checks. Omitting
+    /// them is sound because an input on which this evaluator differs from
+    /// [`HashDomain`] would exhibit a nontrivial discrete-log relation
+    /// between the independently generated Sinsemilla bases — the same
+    /// hardness assumption Orchard already rests on. See the security
+    /// argument in [`sinsemilla::weighted`].
+    static ref ORCHARD_MERKLE_CRH_DOMAIN: UncheckedFixedLengthHashDomain<MERKLE_CRH_WORDS> =
+        UncheckedFixedLengthHashDomain::new(&HashDomain::new("z.cash:Orchard-MerkleCRH"));
 }
 
 /// MerkleCRH^Orchard Hash Function
@@ -70,21 +100,58 @@ lazy_static! {
 /// <https://zips.z.cash/protocol/protocol.pdf#orchardmerklecrh>
 /// <https://zips.z.cash/protocol/protocol.pdf#constants>
 fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pallas::Base {
-    let mut s = bitvec![u8, Lsb0;];
+    ORCHARD_MERKLE_CRH_DOMAIN.hash_words(&merkle_crh_words(layer, left, right))
+}
+
+/// Packs a `MerkleCRH^Orchard` input into its 10-bit Sinsemilla words.
+///
+/// The message is `I2LEBSP_10(l) || left || right` with 255-bit little-endian
+/// child encodings, so the words are: the layer prefix `l`, 25 complete words
+/// of `left`, one word spanning `left`'s top 5 bits and `right`'s low 5 bits,
+/// and 25 words covering the remaining bits of `right`.
+fn merkle_crh_words(layer: u8, left: pallas::Base, right: pallas::Base) -> [u16; MERKLE_CRH_WORDS] {
+    // `u16::BITS as usize`: lossless, 16 always fits in usize.
+    const WINDOW_BITS: usize = u16::BITS as usize;
+
+    /// Reads the 10-bit little-endian word starting at `bit_offset`.
+    fn word_at(bytes: &[u8; 32], bit_offset: usize) -> u16 {
+        let byte_offset = bit_offset / BYTE_BITS;
+        let shift = bit_offset % BYTE_BITS;
+        let window =
+            u16::from(bytes[byte_offset]) | (u16::from(bytes[byte_offset + 1]) << BYTE_BITS);
+        let word = window >> shift;
+
+        if shift + K > WINDOW_BITS {
+            (word | (u16::from(bytes[byte_offset + 2]) << (WINDOW_BITS - shift)))
+                & SINSEMILLA_WORD_MASK
+        } else {
+            word & SINSEMILLA_WORD_MASK
+        }
+    }
+
+    let left = left.to_repr();
+    let right = right.to_repr();
+    let mut words = [0; MERKLE_CRH_WORDS];
 
     // Prefix: l = I2LEBSP_10(MerkleDepth^Orchard − 1 − layer)
-    let l = MERKLE_DEPTH - 1 - layer;
-    s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
-    s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
-    s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+    words[0] = u16::from(MERKLE_DEPTH - 1 - layer);
+    for (index, word) in words[1..MERKLE_CRH_CROSS_CHILD_WORD].iter_mut().enumerate() {
+        *word = word_at(&left, index * K);
+    }
+    let left_tail_offset = MERKLE_CRH_FULL_CHILD_WORDS * K;
+    words[MERKLE_CRH_CROSS_CHILD_WORD] = u16::from(
+        (left[left_tail_offset / BYTE_BITS] >> (left_tail_offset % BYTE_BITS))
+            & CHILD_REMAINDER_MASK,
+    ) | (u16::from(right[0] & CHILD_REMAINDER_MASK)
+        << MERKLE_CRH_CHILD_REMAINDER_BITS);
+    for (index, word) in words[MERKLE_CRH_CROSS_CHILD_WORD + 1..]
+        .iter_mut()
+        .enumerate()
+    {
+        *word = word_at(&right, MERKLE_CRH_CHILD_REMAINDER_BITS + index * K);
+    }
 
-    // Hash with the cached domain instead of `sinsemilla_hash`, which would
-    // rebuild the `HashDomain` (and its `Q` generator) on every call.
-    let hash: Option<pallas::Base> = ORCHARD_MERKLE_CRH_DOMAIN
-        .hash(s.iter().map(|b| *b.as_ref()))
-        .into();
-
-    hash.unwrap_or_else(pallas::Base::zero)
+    words
 }
 
 lazy_static! {
@@ -266,11 +333,10 @@ impl ToHex for Node {
 
 /// Required to serialize [`NoteCommitmentTree`]s in a format compatible with `zcashd`.
 ///
-/// Zebra stores Orchard note commitment trees as [`Frontier`][1]s while the
+/// Zebra stores Orchard note commitment trees as [`Frontier`]s while the
 /// [`z_gettreestate`][2] RPC requires [`CommitmentTree`][3]s. Implementing
 /// [`HashSer`] for [`Node`]s allows the conversion.
 ///
-/// [1]: incrementalmerkletree::frontier::Frontier
 /// [2]: https://zcash.github.io/rpc/z_gettreestate.html
 /// [3]: incrementalmerkletree::frontier::CommitmentTree
 impl HashSer for Node {
@@ -391,6 +457,28 @@ pub struct NoteCommitmentTree {
 }
 
 impl NoteCommitmentTree {
+    /// Wraps an existing [`Frontier`] as a note commitment tree.
+    ///
+    /// # Correctness
+    ///
+    /// [`Frontier::from_parts`] validates only that the position and ommer
+    /// count are consistent and that the frontier fits within
+    /// `MERKLE_DEPTH`. It does not verify that the nodes were derived from
+    /// note commitments or that the root belongs to an authenticated chain
+    /// and shielded pool state.
+    ///
+    /// Callers must derive the frontier from validated commitments or
+    /// authenticate its root against the expected chain and shielded pool
+    /// state before treating the resulting tree as authoritative.
+    ///
+    /// The root cache starts empty and is recomputed on first use.
+    pub fn from_frontier(frontier: Frontier<Node, MERKLE_DEPTH>) -> Self {
+        Self {
+            inner: frontier,
+            cached_root: Default::default(),
+        }
+    }
+
     /// Adds a note commitment x-coordinate to the tree.
     ///
     /// The leaves of the tree are actually a base field element, the
@@ -615,6 +703,19 @@ impl NoteCommitmentTree {
         Some((index, root))
     }
 
+    /// Checks `roots`, the completed subtree roots in index order, against this tree's frontier.
+    ///
+    /// Returns how many roots were checked. See
+    /// [`subtree_verify`](crate::subtree_verify) for what this proves.
+    ///
+    /// Ironwood re-exports this module, so this also serves Ironwood trees.
+    pub fn verify_completed_subtree_roots(
+        &self,
+        roots: &[Node],
+    ) -> Result<usize, SubtreeRootsError> {
+        subtree_verify::verify_completed_subtree_roots(self.frontier(), roots, MERKLE_DEPTH)
+    }
+
     /// Returns the current root of the tree, used as an anchor in Orchard
     /// shielded transactions.
     pub fn root(&self) -> Root {
@@ -769,6 +870,7 @@ impl From<Vec<pallas::Base>> for NoteCommitmentTree {
 
 #[cfg(test)]
 mod tests {
+    use bitvec::prelude::*;
     use incrementalmerkletree::{frontier::Frontier, Position};
 
     use super::*;
@@ -790,10 +892,46 @@ mod tests {
             .expect("small little-endian integers are canonical field elements")
     }
 
-    /// Verbatim copy of the pre-cache `merkle_crh_orchard`: it rebuilds the
-    /// Sinsemilla [`HashDomain`](sinsemilla::HashDomain) (and its `Q` generator)
-    /// from the domain string on every call. The production `merkle_crh_orchard`
-    /// caches that domain and must stay byte-identical to this.
+    /// A tree rebuilt from its own frontier answers exactly like the
+    /// original, and keeps appending identically.
+    #[test]
+    fn from_frontier_round_trips_root_position_and_appends() {
+        let mut original = NoteCommitmentTree::default();
+        for value in 0..37 {
+            original
+                .append(note_commitment(value))
+                .expect("small test tree is not full");
+        }
+
+        let live = original.frontier().expect("37 appends leave a leaf");
+        let frontier = incrementalmerkletree::frontier::Frontier::from_parts(
+            live.position(),
+            *live.leaf(),
+            live.ommers().to_vec(),
+        )
+        .expect("the parts of a live frontier are valid");
+
+        let mut rebuilt = NoteCommitmentTree::from_frontier(frontier);
+
+        assert_eq!(rebuilt.root(), original.root());
+        assert_eq!(rebuilt.count(), original.count());
+        assert_eq!(rebuilt.position(), original.position());
+
+        original
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+        rebuilt
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+
+        assert_eq!(rebuilt.root(), original.root());
+    }
+
+    /// Independent from-scratch `MerkleCRH^Orchard`: it builds the message
+    /// bit-by-bit and hashes it with this crate's own variable-length
+    /// Sinsemilla implementation, rebuilding the domain on every call. The
+    /// production `merkle_crh_orchard` (word packing plus the weighted
+    /// fixed-length evaluator) must stay byte-identical to this.
     fn merkle_crh_orchard_uncached(
         layer: u8,
         left: pallas::Base,
@@ -837,12 +975,13 @@ mod tests {
         ]
     }
 
-    /// The cached-domain `merkle_crh_orchard` must produce byte-identical output
-    /// to recomputing the `HashDomain` from scratch on every call, across all
-    /// layers and a spread of input values — small integers, edge cases, and
-    /// full-width field elements.
+    /// The weighted-evaluator `merkle_crh_orchard` must produce byte-identical
+    /// output to the from-scratch bit-level implementation, across all layers
+    /// and a spread of input values — small integers, edge cases, and
+    /// full-width field elements. The full-width values also exercise the word
+    /// packer's cross-child word and every remainder-bit alignment.
     #[test]
-    fn cached_domain_merkle_crh_matches_fresh_domain() {
+    fn weighted_merkle_crh_matches_fresh_domain() {
         let mut values: Vec<pallas::Base> = [0u64, 1, 2, 7, 65_535, u64::MAX]
             .iter()
             .map(|&v| node(v).0)
@@ -855,7 +994,7 @@ mod tests {
                     assert_eq!(
                         merkle_crh_orchard(layer, left, right).to_repr(),
                         merkle_crh_orchard_uncached(layer, left, right).to_repr(),
-                        "cached domain must match fresh domain at layer {layer}",
+                        "weighted evaluator must match fresh domain at layer {layer}",
                     );
                 }
             }
@@ -864,11 +1003,12 @@ mod tests {
 
     proptest::proptest! {
         /// Randomized differential check: across random layers and random
-        /// full-width field elements (raw limbs reduced mod p), the cached
-        /// domain must stay byte-identical to a freshly rebuilt one. This covers
-        /// the whole input domain that the fixed table above only samples.
+        /// full-width field elements (raw limbs reduced mod p), the weighted
+        /// evaluator must stay byte-identical to the from-scratch bit-level
+        /// implementation. This covers the whole input domain that the fixed
+        /// table above only samples.
         #[test]
-        fn cached_domain_merkle_crh_matches_fresh_domain_random(
+        fn weighted_merkle_crh_matches_fresh_domain_random(
             layer in 0u8..MERKLE_DEPTH,
             left_limbs in proptest::prelude::any::<[u64; 4]>(),
             right_limbs in proptest::prelude::any::<[u64; 4]>(),
@@ -879,7 +1019,7 @@ mod tests {
             proptest::prop_assert_eq!(
                 merkle_crh_orchard(layer, left, right).to_repr(),
                 merkle_crh_orchard_uncached(layer, left, right).to_repr(),
-                "cached domain must match fresh domain at layer {}", layer
+                "weighted evaluator must match fresh domain at layer {}", layer
             );
         }
     }

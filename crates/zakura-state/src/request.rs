@@ -4,8 +4,14 @@ use std::{
     collections::{HashMap, HashSet},
     ops::{Add, Deref, RangeInclusive},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc,
+    },
+    time::Instant,
 };
+
+use tokio::sync::Notify;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -24,7 +30,7 @@ use zakura_chain::{
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
     transaction::{self, UnminedTx},
-    transparent::{self, utxos_from_ordered_utxos},
+    transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -35,6 +41,122 @@ use crate::{
     constants::{MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS},
     ReadResponse, Response,
 };
+
+/// Notifies a mined-block submitter when state admits its block to the active write queue.
+#[derive(Clone)]
+pub struct BlockAdmission(Arc<BlockAdmissionInner>);
+
+#[derive(Debug)]
+struct BlockAdmissionInner {
+    state: AtomicU8,
+    optimistic_relay_authorized: AtomicBool,
+    changed: Notify,
+}
+
+impl BlockAdmission {
+    const PENDING: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const REJECTED: u8 = 2;
+
+    /// Creates a pending admission notification.
+    pub fn pending() -> Self {
+        Self(Arc::new(BlockAdmissionInner {
+            state: AtomicU8::new(Self::PENDING),
+            optimistic_relay_authorized: AtomicBool::new(false),
+            changed: Notify::new(),
+        }))
+    }
+
+    /// Authorizes optimistic relay if state later admits the prepared mined block.
+    #[doc(hidden)]
+    pub fn authorize_optimistic_relay(&self) {
+        self.0
+            .optimistic_relay_authorized
+            .store(true, Ordering::Release);
+    }
+
+    /// Returns true when consensus authorized optimistic relay for this admission.
+    pub fn optimistic_relay_authorized(&self) -> bool {
+        self.0.optimistic_relay_authorized.load(Ordering::Acquire)
+    }
+
+    /// Marks the block as admitted to the active non-finalized write queue.
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        if !optimistic_relay_still_authorized {
+            self.0
+                .optimistic_relay_authorized
+                .store(false, Ordering::Release);
+        }
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Marks the block as rejected before admission.
+    pub(crate) fn reject(&self) {
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Waits until state admits or rejects the block.
+    ///
+    /// # Correctness
+    ///
+    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
+    /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
+    /// receives the block leaves the admission pending. Callers must await this future under a
+    /// cancellation path, such as a `select!` arm that also awaits verification.
+    pub async fn wait(&self) -> bool {
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.0.state.load(Ordering::Acquire) {
+                Self::ADMITTED => return true,
+                Self::REJECTED => return false,
+                Self::PENDING => notified.as_mut().await,
+                _ => unreachable!("block admission state only uses declared constants"),
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BlockAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockAdmission")
+            .field(&self.0.state.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PartialEq for BlockAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for BlockAdmission {}
 use crate::{
     error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
     CommitSemanticallyVerifiedError,
@@ -274,6 +396,24 @@ pub struct SemanticallyVerifiedBlock {
     pub auth_data_root: Option<AuthDataRoot>,
 }
 
+/// Data required to check a prepared mined block before optimistic relay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockCommitmentData {
+    /// The block whose header commits to the prepared body and parent history.
+    pub block: Arc<Block>,
+    /// The precomputed authorizing-data commitment root, when available.
+    pub auth_data_root: Option<AuthDataRoot>,
+}
+
+impl From<&SemanticallyVerifiedBlock> for BlockCommitmentData {
+    fn from(block: &SemanticallyVerifiedBlock) -> Self {
+        Self {
+            block: block.block.clone(),
+            auth_data_root: block.auth_data_root,
+        }
+    }
+}
+
 /// A block ready to be committed directly to the finalized state with
 /// a small number of checks if compared with a `ContextuallyVerifiedBlock`.
 ///
@@ -326,7 +466,7 @@ pub struct ContextuallyVerifiedBlock {
     /// earlier transaction.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// The outputs spent by this block, indexed by the [`transparent::Input`]'s
     /// [`OutPoint`](transparent::OutPoint).
@@ -335,7 +475,7 @@ pub struct ContextuallyVerifiedBlock {
     /// or earlier blocks in the chain.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
@@ -502,15 +642,19 @@ impl ContextuallyVerifiedBlock {
     /// Create a block that's ready for non-finalized `Chain` contextual validation,
     /// using a [`SemanticallyVerifiedBlock`] and the UTXOs it spends.
     ///
-    /// When combined, `semantically_verified.new_outputs` and `spent_utxos` must contain
-    /// the [`Utxo`](transparent::Utxo)s spent by every transparent input in this block,
-    /// including UTXOs created by earlier transactions in this block.
+    /// `spent_outputs` must contain the [`Utxo`](transparent::Utxo) spent by
+    /// every transparent input in this block. This includes UTXOs created by
+    /// earlier transactions in the same block.
     ///
     /// Note: a [`ContextuallyVerifiedBlock`] isn't actually contextually valid until
     /// [`Chain::push()`](crate::service::non_finalized_state::Chain::push) returns success.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
         semantically_verified: SemanticallyVerifiedBlock,
-        mut spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
@@ -522,23 +666,19 @@ impl ContextuallyVerifiedBlock {
             auth_data_root: _,
         } = semantically_verified;
 
-        // This is redundant for the non-finalized state,
-        // but useful to make some tests pass more easily.
-        //
-        // TODO: fix the tests, and stop adding unrelated outputs.
-        spent_outputs.extend(new_outputs.clone());
+        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            &spent_outputs,
+            deferred_pool_balance_change,
+        )?;
 
         Ok(Self {
-            block: block.clone(),
+            block,
             hash,
             height,
-            new_outputs,
-            spent_outputs: spent_outputs.clone(),
+            new_outputs: Arc::new(new_outputs),
+            spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
-            chain_value_pool_change: block.chain_value_pool_change(
-                &utxos_from_ordered_utxos(spent_outputs),
-                deferred_pool_balance_change,
-            )?,
+            chain_value_pool_change,
         })
     }
 }
@@ -691,6 +831,43 @@ mod tests {
     }
 
     #[test]
+    fn contextual_block_clone_shares_immutable_utxo_maps() {
+        let _init_guard = zakura_test::init();
+
+        let block = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("the genesis block deserializes"),
+        );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(block),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        let cloned = contextual.clone();
+
+        assert!(Arc::ptr_eq(&contextual.new_outputs, &cloned.new_outputs));
+        assert!(Arc::ptr_eq(
+            &contextual.spent_outputs,
+            &cloned.spent_outputs
+        ));
+
+        let semantic = SemanticallyVerifiedBlock::from(cloned);
+        assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+
+        let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(contextual.block.clone()),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        assert_eq!(Arc::strong_count(&unique.new_outputs), 1);
+        let expected_outputs = unique.new_outputs.as_ref().clone();
+
+        let semantic = SemanticallyVerifiedBlock::from(unique);
+        assert_eq!(semantic.new_outputs, expected_outputs);
+    }
+
+    #[test]
     fn checkpoint_precomputed_auth_data_root_matches_its_block() {
         let _init_guard = zakura_test::init();
 
@@ -707,6 +884,28 @@ mod tests {
 
         assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
     }
+
+    #[tokio::test]
+    async fn block_admission_keeps_its_first_terminal_state() {
+        let rejected = BlockAdmission::pending();
+        assert!(!rejected.optimistic_relay_authorized());
+        rejected.authorize_optimistic_relay();
+        assert!(rejected.optimistic_relay_authorized());
+        rejected.reject();
+        rejected.admit(true);
+        assert!(!rejected.wait().await);
+
+        let admitted = BlockAdmission::pending();
+        admitted.admit(true);
+        admitted.reject();
+        assert!(admitted.wait().await);
+
+        let stale = BlockAdmission::pending();
+        stale.authorize_optimistic_relay();
+        stale.admit(false);
+        assert!(stale.wait().await);
+        assert!(!stale.optimistic_relay_authorized());
+    }
 }
 
 impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
@@ -715,7 +914,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: valid.new_outputs,
+            new_outputs: Arc::unwrap_or_clone(valid.new_outputs),
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
@@ -829,42 +1028,6 @@ impl MappedRequest for CommitCheckpointVerifiedBlockRequest {
     }
 }
 
-/// Authenticate canonical supplied header roots through the serialized state writer.
-pub struct AuthenticateHeaderRootsRequest {
-    /// Exact compact state snapshot used to construct this request.
-    pub expected_state: crate::HeaderRootAuthState,
-    /// Current authenticated frontier hash.
-    pub anchor: block::Hash,
-    /// First supplied item height.
-    pub start: block::Height,
-    /// Canonical stored headers.
-    pub headers: Vec<Arc<block::Header>>,
-    /// Roots aligned with `headers`.
-    pub roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-}
-
-impl MappedRequest for AuthenticateHeaderRootsRequest {
-    type MappedResponse = crate::AuthenticatedHeaderRoots;
-    type Error = crate::AuthenticateHeaderRootsError;
-
-    fn map_request(self) -> Request {
-        Request::AuthenticateHeaderRoots {
-            expected_state: self.expected_state,
-            anchor: self.anchor,
-            start: self.start,
-            headers: self.headers,
-            roots: self.roots,
-        }
-    }
-
-    fn map_response(response: Response) -> Self::MappedResponse {
-        match response {
-            Response::AuthenticatedHeaderRoots(success) => success,
-            _ => unreachable!("wrong response variant for request"),
-        }
-    }
-}
-
 /// Request to invalidate a block in the state.
 ///
 /// See the [`crate`] documentation and [`Request::InvalidateBlock`] for details.
@@ -909,10 +1072,211 @@ impl MappedRequest for ReconsiderBlockRequest {
     }
 }
 
+/// The verifier or registered scheduler adapter seals one body-evidence event.
+/// The serialized state writer then receives the sealed event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedHeaderChainBodyEvidence {
+    expected_version: zakura_header_chain::StateVersion,
+    event: zakura_header_chain::TransitionEvent,
+    staged_authority: zakura_header_chain::EvidenceId,
+}
+
+/// One exact completion sealed after the registered-attempt gate accepted it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedHeaderChainInsert {
+    insert: Box<zakura_header_chain::InsertHeaders>,
+    permit: HeaderCompletionPermit,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderCompletionPermit(Arc<AtomicBool>);
+
+impl HeaderCompletionPermit {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn consume(self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+impl PartialEq for HeaderCompletionPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HeaderCompletionPermit {}
+
+/// Capability that the full verifier or registered body scheduler uses to seal evidence.
+///
+/// The ordinary state service does not expose this capability.
+/// Node orchestration receives the capability separately.
+/// Node orchestration passes it only to the adapter that consumes completion-gated body outcomes.
+#[derive(Clone, Debug)]
+pub struct HeaderChainBodyEvidenceAuthority {
+    _private: (),
+}
+
+impl HeaderChainBodyEvidenceAuthority {
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    /// Seal one exact normal or repair completion accepted by the registered-attempt gate.
+    pub fn from_registered_header_attempt(
+        &self,
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    ) -> PreparedHeaderChainInsert {
+        PreparedHeaderChainInsert {
+            insert,
+            permit: HeaderCompletionPermit::new(),
+        }
+    }
+
+    /// Seal retryable evidence derived from one registered body attempt.
+    pub fn from_registered_attempt(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        failure: zakura_header_chain::TransientBodyFailure,
+    ) -> PreparedHeaderChainBodyEvidence {
+        PreparedHeaderChainBodyEvidence {
+            expected_version,
+            staged_authority: failure.evidence,
+            event: zakura_header_chain::TransitionEvent::BodyEvidence(
+                zakura_header_chain::BodyEvidence::Transient(failure),
+            ),
+        }
+    }
+
+    /// Seal deterministic evidence produced by the full block verifier.
+    pub fn from_full_verifier(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    ) -> PreparedHeaderChainBodyEvidence {
+        PreparedHeaderChainBodyEvidence {
+            expected_version,
+            staged_authority: invalid.evidence,
+            event: zakura_header_chain::TransitionEvent::BodyEvidence(
+                zakura_header_chain::BodyEvidence::ConsensusInvalid(invalid),
+            ),
+        }
+    }
+
+    /// Seal a supplier-set change derived from one registered scheduler observation.
+    pub fn from_registered_supplier(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    ) -> PreparedHeaderChainBodyEvidence {
+        PreparedHeaderChainBodyEvidence {
+            expected_version,
+            staged_authority: discovery.evidence,
+            event: zakura_header_chain::TransitionEvent::BodySupplierDiscovered(discovery),
+        }
+    }
+
+    /// Seal one exact retry action emitted by the registered block scheduler.
+    pub fn from_registered_retry(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        retry: zakura_header_chain::OperatorBodyRetry,
+    ) -> PreparedHeaderChainBodyEvidence {
+        PreparedHeaderChainBodyEvidence {
+            expected_version,
+            staged_authority: retry.evidence,
+            event: zakura_header_chain::TransitionEvent::OperatorBodyRetry(retry),
+        }
+    }
+
+    /// Construct a sealing capability for a test-only service adapter.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub const fn new_test() -> Self {
+        Self::new()
+    }
+}
+
+impl PreparedHeaderChainInsert {
+    pub(crate) fn into_insert(self) -> Option<Box<zakura_header_chain::InsertHeaders>> {
+        self.permit.consume().then_some(self.insert)
+    }
+}
+
+#[cfg(test)]
+mod header_completion_permit_tests {
+    use super::HeaderCompletionPermit;
+
+    #[test]
+    fn cloned_completion_permit_is_consumed_exactly_once() {
+        let first = HeaderCompletionPermit::new();
+        let replay = first.clone();
+        assert!(first.consume());
+        assert!(!replay.consume());
+    }
+}
+
+impl PreparedHeaderChainBodyEvidence {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        zakura_header_chain::TransitionRequest,
+        zakura_header_chain::EvidenceId,
+    ) {
+        (
+            zakura_header_chain::TransitionRequest {
+                expected_version: self.expected_version,
+                event: self.event,
+            },
+            self.staged_authority,
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A query about or modification to the chain state, via the
 /// [`StateService`](crate::service::StateService).
 pub enum Request {
+    /// Atomically admit one complete, already prepared header target through the serialized
+    /// fork-aware header-chain writer.
+    ApplyHeaderChainInsert {
+        /// Sealed complete-target insertion.
+        /// The type excludes other transition authorities.
+        prepared: PreparedHeaderChainInsert,
+    },
+
+    /// Persist one retryable body-availability result through the serialized
+    /// fork-aware header-chain writer.
+    ///
+    /// The unavailable-body request accepts only transient evidence.
+    /// Only the full verifier boundary can construct deterministic consensus invalidity.
+    RecordHeaderChainBodyUnavailable {
+        /// One-shot evidence sealed by the registered body-attempt adapter.
+        prepared: PreparedHeaderChainBodyEvidence,
+    },
+
+    /// Persist one commitment-matching deterministic body rejection through the
+    /// serialized fork-aware header-chain writer.
+    RecordHeaderChainBodyInvalid {
+        /// One-shot deterministic evidence sealed by the full verifier adapter.
+        prepared: PreparedHeaderChainBodyEvidence,
+    },
+
+    /// Persist authenticated supplier discovery without resetting the alarm episode.
+    RestartHeaderChainBodyAvailability {
+        /// One-shot supplier evidence sealed by the registered scheduler adapter.
+        prepared: PreparedHeaderChainBodyEvidence,
+    },
+
+    /// Persist a fresh retry episode after an authenticated operator request.
+    RetryHeaderChainBodyAvailability {
+        /// One-shot action sealed by the separately held scheduler capability.
+        prepared: PreparedHeaderChainBodyEvidence,
+    },
+
     /// Performs contextual validation of the given semantically verified block,
     /// committing it to the state if successful.
     ///
@@ -936,6 +1300,16 @@ pub enum Request {
     ///
     /// [0]: (crate::error::CommitSemanticallyVerifiedError)
     CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
+
+    /// Commits a mined block and reports when state admits it to the active write queue.
+    CommitSemanticallyVerifiedBlockWithAdmission {
+        /// The semantically verified mined block.
+        block: SemanticallyVerifiedBlock,
+        /// The admission notification.
+        admission: BlockAdmission,
+        /// When consensus submitted this request to the buffered state service.
+        requested_at: Instant,
+    },
 
     /// Commit a checkpointed block to the state, skipping most but not all
     /// contextual validation.
@@ -991,46 +1365,6 @@ pub enum Request {
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
-    /// Persist a validated, contiguous run of Zakura headers that links to `anchor`.
-    ///
-    /// Header-only commits write separate header-sync indexes, not finalized block
-    /// indexes. They do not write transaction/body rows and therefore do not make
-    /// the block known to body-serving APIs.
-    CommitHeaderRange {
-        /// Hash of the held parent header for the first header in `headers`.
-        anchor: block::Hash,
-        /// Contiguous headers in ascending height order.
-        headers: Vec<Arc<block::Header>>,
-        /// Advisory serialized body sizes, parallel to `headers`.
-        ///
-        /// A `0` value means unknown. These hints are not consensus data.
-        body_sizes: Vec<u32>,
-        /// Legacy tree-aux payload, ignored by header validity and persistence.
-        ///
-        /// Call [`Request::AuthenticateHeaderRoots`] after the canonical headers
-        /// are durable to authenticate and promote aligned roots.
-        tree_aux_roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    },
-
-    /// Authenticate aligned roots for canonical stored headers and durably promote them.
-    ///
-    /// The range must start immediately after `expected_state`'s authenticated
-    /// height. Normal advancement includes at least one root plus its successor
-    /// header witness; an explicitly scheduled missing-witness recovery contains
-    /// exactly the terminal witness record.
-    AuthenticateHeaderRoots {
-        /// Exact compact state snapshot on which the caller built this request.
-        expected_state: crate::HeaderRootAuthState,
-        /// Current authenticated frontier hash.
-        anchor: block::Hash,
-        /// First supplied header and root height.
-        start: block::Height,
-        /// Canonical stored headers in ascending contiguous order.
-        headers: Vec<Arc<block::Header>>,
-        /// Roots aligned one-for-one with `headers`.
-        roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    },
-
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
     /// Returns
@@ -1062,16 +1396,6 @@ pub enum Request {
     /// * [`Response::Transaction(None)`](Response::Transaction) otherwise.
     Transaction(transaction::Hash),
 
-    /// Looks up a transaction by hash in any chain.
-    ///
-    /// Returns
-    ///
-    /// * [`Response::AnyChainTransaction(Some(AnyTx))`](Response::AnyChainTransaction)
-    ///   if the transaction is in any chain;
-    /// * [`Response::AnyChainTransaction(None)`](Response::AnyChainTransaction)
-    ///   otherwise.
-    AnyChainTransaction(transaction::Hash),
-
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
     ///
@@ -1100,14 +1424,6 @@ pub enum Request {
     /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
     /// [`block::Height`] using `.into()`.
     AnyChainBlock(HashOrHeight),
-
-    //// Same as Block, but also returns serialized block size.
-    ////
-    /// Returns
-    ///
-    /// * [`ReadResponse::BlockAndSize(Some((Arc<Block>, usize)))`](ReadResponse::BlockAndSize) if the block is in the best chain;
-    /// * [`ReadResponse::BlockAndSize(None)`](ReadResponse::BlockAndSize) otherwise.
-    BlockAndSize(HashOrHeight),
 
     /// Looks up a block header by hash or height in the current best chain.
     ///
@@ -1191,6 +1507,9 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the expected work, body commitment, parent history, and selected tip.
+    CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`Response::BestChainNextMedianTimePast`] when successful.
@@ -1241,25 +1560,38 @@ impl Request {
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
+            Request::ApplyHeaderChainInsert { .. } => "apply_header_chain_insert",
+            Request::RecordHeaderChainBodyUnavailable { .. } => {
+                "record_header_chain_body_unavailable"
+            }
+            Request::RecordHeaderChainBodyInvalid { .. } => "record_header_chain_body_invalid",
+            Request::RestartHeaderChainBodyAvailability { .. } => {
+                "restart_header_chain_body_availability"
+            }
+            Request::RetryHeaderChainBodyAvailability { .. } => {
+                "retry_header_chain_body_availability"
+            }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
+            Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
+                "commit_semantically_verified_block_with_admission"
+            }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
-            Request::CommitHeaderRange { .. } => "commit_header_range",
-            Request::AuthenticateHeaderRoots { .. } => "authenticate_header_roots",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
-            Request::AnyChainTransaction(_) => "any_chain_transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             Request::Block(_) => "block",
             Request::AnyChainBlock(_) => "any_chain_block",
-            Request::BlockAndSize(_) => "block_and_size",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
             Request::FindBlockHeaders { .. } => "find_block_headers",
             Request::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
+            }
+            Request::CheckPreparedMinedRelayEligibility(_) => {
+                "check_prepared_mined_relay_eligibility"
             }
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
@@ -1286,10 +1618,13 @@ impl Request {
 /// [`ReadStateService`](crate::service::ReadStateService).
 pub enum ReadRequest {
     /// Returns [`ReadResponse::UsageInfo(num_bytes: u64)`](ReadResponse::UsageInfo)
-    /// with the current disk space usage in bytes.
+    /// with a recent estimate of the disk space usage in bytes.
+    ///
+    /// The state service refreshes this estimate with its RocksDB metrics, normally every 30
+    /// seconds.
     UsageInfo,
 
-    /// Returns [`ReadResponse::PruningInfo`](ReadResponse::PruningInfo) with
+    /// Returns [`ReadResponse::PruningInfo`] with
     /// whether this node's block data is subject to pruning, and the lowest
     /// height at and above which every block body is retained.
     PruningInfo,
@@ -1479,15 +1814,66 @@ pub enum ReadRequest {
         stop: Option<block::Hash>,
     },
 
-    /// Returns contiguous headers by height, in ascending order.
-    ///
-    /// The response stops before the first missing height and is capped by
-    /// [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
-    HeadersByHeightRange {
-        /// First height to read.
-        start: block::Height,
-        /// Maximum number of headers to return.
-        count: u32,
+    /// Returns the latest atomic committed header-engine snapshot after semantic handoff.
+    HeaderChainSnapshot,
+
+    /// Returns the exact committed selected-header locator after semantic handoff.
+    HeaderLocator,
+
+    /// Return the exact immutable branch context for preparing children of `parent_hash`.
+    HeaderValidationLease {
+        /// Retained parent that the requester's initial locator intersection fixes.
+        parent_hash: block::Hash,
+    },
+
+    /// Resolve one current branch-owned VCT repair to its exact selected request context.
+    VctRepairContext {
+        /// Complete owner that the scheduler captured when it scheduled the repair.
+        owner: zakura_header_chain::BodyWorkOwner,
+        /// Exact selected height that lacks auxiliary metadata.
+        height: block::Height,
+    },
+
+    /// Acquire one immutable retained path for an exact header-sync target.
+    AcquireRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact target named by the peer's status.
+        target_tip_hash: block::Hash,
+        /// Request correlation scope. Head progress does not stale this read-only lease.
+        scope: zakura_header_chain::HeaderWorkAuthority,
+        /// Locator hashes in requester order.
+        locator_hashes: Vec<block::Hash>,
+    },
+
+    /// Read one bounded hash-keyed page and consume its lease on success.
+    ReadRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact state-issued lease identity.
+        lease_id: u64,
+        /// Exact generation and branch that the lease fixes.
+        scope: zakura_header_chain::HeaderWorkAuthority,
+        /// Common ancestor or prior page tip.
+        after_hash: block::Hash,
+        /// Maximum nodes returned.
+        max_count: u32,
+    },
+
+    /// Release one retained path owned by this exact peer session.
+    ReleaseRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact state-issued lease identity.
+        lease_id: u64,
+        /// Exact generation and branch that the lease fixes.
+        scope: zakura_header_chain::HeaderWorkAuthority,
     },
 
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
@@ -1500,19 +1886,8 @@ pub enum ReadRequest {
         count: u32,
     },
 
-    /// Returns the highest contiguous header held in the durable full-block/header database.
-    ///
-    /// This request never consults the in-memory non-finalized chain, so its
-    /// result is safe to use as a [`Request::CommitHeaderRange`] anchor.
-    BestDurableHeaderTip,
-
-    /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
-    MissingBlockBodies {
-        /// First height to consider.
-        from: block::Height,
-        /// Maximum number of heights to return.
-        limit: u32,
-    },
+    /// Returns the highest header held on disk.
+    BestHeaderTip,
 
     /// Returns header-known, body-missing block metadata for block-sync scheduling.
     MissingBlockBodyMetadata {
@@ -1522,21 +1897,30 @@ pub enum ReadRequest {
         limit: u32,
     },
 
-    /// Returns scheduling-only body-size hints for a contiguous height range.
-    ///
-    /// Confirmed committed block sizes win over untrusted advertised header
-    /// hints. Unknown advertised sizes are returned as `None`.
-    BlockSizeHints {
-        /// First height to read.
-        from: block::Height,
-        /// Maximum number of heights to return.
-        count: u32,
-    },
-
     /// Returns contiguous committed blocks by height, in ascending order.
     ///
     /// The response stops before the first height without a committed body.
+    /// Callers that charge resources to the database job should instead use
+    /// [`crate::ReadStateService::read_owned_block_range`] so cancellation of
+    /// the caller cannot release those resources during a running read.
     BlocksByHeightRange {
+        /// First height to read.
+        start: block::Height,
+        /// Maximum number of blocks to return.
+        count: u32,
+    },
+
+    /// Returns contiguous committed blocks by height from the finalized state,
+    /// in ascending order, as their raw Zcash consensus serializations.
+    ///
+    /// The response stops before the first height without a committed body, so
+    /// it never includes non-finalized blocks and ends at the finalized tip.
+    ///
+    /// Returns
+    ///
+    /// [`ReadResponse::RawBlocks(Vec<(block::Height, Vec<u8>)>)`](crate::ReadResponse::RawBlocks).
+    #[cfg(feature = "indexer")]
+    RawBlocksByHeightRange {
         /// First height to read.
         start: block::Height,
         /// Maximum number of blocks to return.
@@ -1654,6 +2038,9 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the expected work, body commitment, parent history, and selected tip.
+    CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`ReadResponse::BestChainNextMedianTimePast`] when successful.
@@ -1698,6 +2085,18 @@ pub enum ReadRequest {
     /// with the current best chain tip block size in bytes.
     TipBlockSize,
 
+    /// Returns [`ReadResponse::ChainTips(Vec<ChainTipInfo>)`](ReadResponse::ChainTips)
+    /// with the tip of every chain this node currently tracks, in descending
+    /// height order.
+    ///
+    /// This covers the best chain, the non-finalized forks, recently invalidated
+    /// branches, and the selected header chain when some block bodies are
+    /// unavailable. Its cost is bounded by the number of tracked forks, not by the
+    /// height of the chain.
+    ///
+    /// Used by the `getchaintips` RPC.
+    ChainTips,
+
     /// Returns [`ReadResponse::NonFinalizedBlocksListener`] with a channel receiver
     /// allowing the caller to listen for new blocks in the non-finalized state.
     NonFinalizedBlocksListener {
@@ -1739,13 +2138,19 @@ impl ReadRequest {
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
-            ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
+            ReadRequest::HeaderChainSnapshot => "header_chain_snapshot",
+            ReadRequest::HeaderLocator => "header_locator",
+            ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
+            ReadRequest::VctRepairContext { .. } => "vct_repair_context",
+            ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
+            ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
+            ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
-            ReadRequest::BestDurableHeaderTip => "best_durable_header_tip",
-            ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
+            ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
-            ReadRequest::BlockSizeHints { .. } => "block_size_hints",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
+            #[cfg(feature = "indexer")]
+            ReadRequest::RawBlocksByHeightRange { .. } => "raw_blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",
             ReadRequest::OrchardTree { .. } => "orchard_tree",
             ReadRequest::IronwoodTree { .. } => "ironwood_tree",
@@ -1758,6 +2163,9 @@ impl ReadRequest {
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
+            ReadRequest::CheckPreparedMinedRelayEligibility(_) => {
+                "check_prepared_mined_relay_eligibility"
+            }
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]
@@ -1766,6 +2174,7 @@ impl ReadRequest {
             ReadRequest::SolutionRate { .. } => "solution_rate",
             ReadRequest::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             ReadRequest::TipBlockSize => "tip_block_size",
+            ReadRequest::ChainTips => "chain_tips",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
         }
@@ -1799,10 +2208,8 @@ impl TryFrom<Request> for ReadRequest {
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }
-            Request::BlockAndSize(hash_or_height) => Ok(ReadRequest::BlockAndSize(hash_or_height)),
             Request::BlockHeader(hash_or_height) => Ok(ReadRequest::BlockHeader(hash_or_height)),
             Request::Transaction(tx_hash) => Ok(ReadRequest::Transaction(tx_hash)),
-            Request::AnyChainTransaction(tx_hash) => Ok(ReadRequest::AnyChainTransaction(tx_hash)),
             Request::UnspentBestChainUtxo(outpoint) => {
                 Ok(ReadRequest::UnspentBestChainUtxo(outpoint))
             }
@@ -1818,11 +2225,18 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
+            Request::CheckPreparedMinedRelayEligibility(block) => {
+                Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
+            }
 
-            Request::CommitSemanticallyVerifiedBlock(_)
+            Request::ApplyHeaderChainInsert { .. }
+            | Request::RecordHeaderChainBodyUnavailable { .. }
+            | Request::RecordHeaderChainBodyInvalid { .. }
+            | Request::RestartHeaderChainBodyAvailability { .. }
+            | Request::RetryHeaderChainBodyAvailability { .. }
+            | Request::CommitSemanticallyVerifiedBlock(_)
+            | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CommitHeaderRange { .. }
-            | Request::AuthenticateHeaderRoots { .. }
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 
@@ -1845,53 +2259,6 @@ impl TryFrom<Request> for ReadRequest {
 pub struct TimedSpan {
     timer: CodeTimer,
     span: tracing::Span,
-}
-
-#[cfg(test)]
-mod header_root_auth_tests {
-    use super::*;
-
-    #[test]
-    fn typed_header_root_auth_request_dispatches_typed_response() {
-        let state = crate::HeaderRootAuthState {
-            authenticated_height: block::Height(10),
-            authenticated_hash: block::Hash([1; 32]),
-            completed_checkpoint_height: block::Height(20),
-            completed_checkpoint_hash: block::Hash([2; 32]),
-            header_witness: None,
-        };
-        let request = AuthenticateHeaderRootsRequest {
-            expected_state: state,
-            anchor: state.authenticated_hash,
-            start: block::Height(11),
-            headers: Vec::new(),
-            roots: Vec::new(),
-        }
-        .map_request();
-        assert_eq!(request.variant_name(), "authenticate_header_roots");
-        assert!(matches!(
-            request,
-            Request::AuthenticateHeaderRoots {
-                expected_state,
-                anchor,
-                start: block::Height(11),
-                ..
-            } if expected_state == state && anchor == state.authenticated_hash
-        ));
-
-        let success = crate::AuthenticatedHeaderRoots {
-            state,
-            update: crate::HeaderRootAuthUpdate::Advanced {
-                authenticated: block::Height(11)..=block::Height(19),
-            },
-        };
-        assert_eq!(
-            AuthenticateHeaderRootsRequest::map_response(Response::AuthenticatedHeaderRoots(
-                success.clone()
-            )),
-            success
-        );
-    }
 }
 
 impl TimedSpan {

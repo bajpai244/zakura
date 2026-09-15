@@ -4,7 +4,6 @@ use std::{collections::HashSet, sync::Arc};
 
 use chrono::{DateTime, Utc};
 
-use mset::MultiSet;
 use zakura_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
@@ -19,13 +18,37 @@ use zakura_chain::{
     },
     transaction::{self, Transaction},
     transparent::{Address, Output},
-    work::{
-        difficulty::{ExpandedDifficulty, ParameterDifficulty as _},
-        equihash,
-    },
+    work::{difficulty::ExpandedDifficulty, equihash},
 };
+use zakura_header_chain::{CompactTargetError, PowPolicy};
 
 use crate::{error::*, funding_stream_address};
+
+/// Coinbase outputs that have not yet matched a required subsidy payment.
+///
+/// The source transaction bounds this vector through its serialized size limit.
+struct UnmatchedCoinbaseOutputs {
+    outputs: Vec<Output>,
+}
+
+impl UnmatchedCoinbaseOutputs {
+    /// Copies the bounded outputs from a coinbase transaction.
+    fn new(outputs: &[Output]) -> Self {
+        Self {
+            outputs: outputs.to_vec(),
+        }
+    }
+
+    /// Removes one matching output, preserving duplicate output multiplicity.
+    fn remove(&mut self, expected: &Output) -> bool {
+        let Some(index) = self.outputs.iter().position(|output| output == expected) else {
+            return false;
+        };
+
+        self.outputs.remove(index);
+        true
+    }
+}
 
 /// Checks if there is exactly one coinbase transaction in `Block`,
 /// and if that coinbase transaction is the first transaction in the block.
@@ -79,27 +102,13 @@ pub fn difficulty_threshold_is_valid(
     height: &Height,
     hash: &Hash,
 ) -> Result<ExpandedDifficulty, BlockError> {
-    let difficulty_threshold = header
-        .difficulty_threshold
-        .to_expanded()
-        .ok_or(BlockError::InvalidDifficulty(*height, *hash))?;
-
-    // Note: the comparison in this function is a u256 integer comparison, like
-    // zcashd and bitcoin. Greater values represent *less* work.
-
-    // The PowLimit check is part of `Threshold()` in the spec, but it doesn't
-    // actually depend on any previous blocks.
-    if difficulty_threshold > network.target_difficulty_limit() {
-        Err(BlockError::TargetDifficultyLimit(
-            *height,
-            *hash,
-            difficulty_threshold,
-            network.clone(),
-            network.target_difficulty_limit(),
-        ))?;
+    match zakura_header_chain::validate_compact_target(header, network) {
+        Ok(target) => Ok(target),
+        Err(CompactTargetError::Invalid) => Err(BlockError::InvalidDifficulty(*height, *hash)),
+        Err(CompactTargetError::EasierThanLimit { target, limit }) => Err(
+            BlockError::TargetDifficultyLimit(*height, *hash, target, network.clone(), limit),
+        ),
     }
-
-    Ok(difficulty_threshold)
 }
 
 /// Returns `Ok(())` if `hash` passes:
@@ -127,13 +136,13 @@ pub fn difficulty_is_valid(
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
     //
     // The difficulty filter is also context-free.
-    if hash > &difficulty_threshold {
-        Err(BlockError::DifficultyFilter(
+    if zakura_header_chain::validate_hash_filter(*hash, difficulty_threshold).is_err() {
+        return Err(BlockError::DifficultyFilter(
             *height,
             *hash,
             difficulty_threshold,
             network.clone(),
-        ))?;
+        ));
     }
 
     Ok(())
@@ -153,7 +162,7 @@ pub fn equihash_solution_is_valid(
     // The Equihash `(n, k)` parameters are bound to `network`, so a peer cannot
     // downgrade the proof of work to the trivial Regtest `(48, 5)` parameters
     // by sending a short 36-byte solution on Mainnet or Testnet.
-    header.solution.check(header, network)
+    PowPolicy::validating(network).validate_solution(header)
 }
 
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
@@ -171,14 +180,13 @@ pub fn subsidy_is_valid(
 
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
 
-    let mut coinbase_outputs: MultiSet<Output> = block
-        .transactions
-        .first()
-        .ok_or(SubsidyError::NoCoinbase)?
-        .outputs()
-        .iter()
-        .cloned()
-        .collect();
+    let mut coinbase_outputs = UnmatchedCoinbaseOutputs::new(
+        block
+            .transactions
+            .first()
+            .ok_or(SubsidyError::NoCoinbase)?
+            .outputs(),
+    );
 
     let mut has_amount = |addr: &Address, amount| {
         assert!(addr.is_script_hash(), "address must be P2SH");
@@ -393,7 +401,7 @@ pub fn time_is_valid_at(
     height: &Height,
     hash: &Hash,
 ) -> Result<(), zakura_chain::block::BlockTimeError> {
-    header.time_is_valid_at(now, height, hash)
+    zakura_header_chain::validate_future_time(header, now, *height, *hash)
 }
 
 /// Check Merkle root validity.
@@ -455,4 +463,35 @@ pub fn merkle_root_validity(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::{
+        amount::{Amount, NonNegative},
+        transparent::{Output, Script},
+    };
+
+    use super::UnmatchedCoinbaseOutputs;
+
+    fn output(value: u64) -> Output {
+        let value = Amount::<NonNegative>::try_from(value).expect("test value is a valid amount");
+        Output::new(value, Script::new(&[]))
+    }
+
+    #[test]
+    fn unmatched_coinbase_outputs_remove_one_duplicate_at_a_time() {
+        let repeated_output = output(1);
+        let distinct_output = output(2);
+        let mut outputs = UnmatchedCoinbaseOutputs::new(&[
+            repeated_output.clone(),
+            repeated_output.clone(),
+            distinct_output.clone(),
+        ]);
+
+        assert!(outputs.remove(&repeated_output));
+        assert!(outputs.remove(&repeated_output));
+        assert!(!outputs.remove(&repeated_output));
+        assert!(outputs.remove(&distinct_output));
+    }
 }

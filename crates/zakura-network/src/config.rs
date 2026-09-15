@@ -13,7 +13,7 @@ use std::{
 
 use indexmap::IndexSet;
 use iroh::SecretKey;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::fs;
 
@@ -337,9 +337,9 @@ pub struct Config {
     /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
     pub max_connections_per_ip: usize,
 
-    /// Exposes legacy peer IP addresses in peer activity logs, structured trace files, and
-    /// Prometheus metric labels. This includes connected peers and candidate or address book
-    /// entries.
+    /// Exposes legacy peer IP addresses in peer activity logs and structured trace files.
+    /// This includes connected peers and candidate or address book entries.
+    /// Seed and peer-cache Prometheus metrics also use this setting for `remote_ip` labels.
     ///
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
@@ -348,9 +348,8 @@ pub struct Config {
     ///
     /// # Security
     ///
-    /// Enabling this setting reveals peer topology in logs and trace files, and can create
-    /// high-cardinality metric series. Restrict access to logs, trace directories, the metrics
-    /// endpoint, and downstream monitoring systems.
+    /// Enabling this setting reveals peer topology in logs and trace files. Restrict access
+    /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 }
 
@@ -724,7 +723,7 @@ impl Config {
 
     /// Resolves the Zakura native iroh [`SecretKey`] for this node, persisting a
     /// freshly generated key on first use so the node keeps a stable
-    /// [`NodeId`](iroh::NodeId) across restarts.
+    /// [`EndpointId`](iroh::EndpointId) across restarts.
     ///
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
@@ -786,6 +785,10 @@ impl Config {
 
         Config {
             p2p_stack,
+            zakura: ZakuraConfig {
+                listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
+                ..ZakuraConfig::default()
+            },
             ..Config::default()
         }
     }
@@ -813,7 +816,9 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
         ),
     }
 
-    let secret_key = SecretKey::generate(OsRng);
+    let mut key_bytes = [0; 32];
+    OsRng.fill_bytes(&mut key_bytes);
+    let secret_key = SecretKey::from_bytes(&key_bytes);
     persist_zakura_secret_key(key_file, &secret_key);
     secret_key
 }
@@ -954,6 +959,8 @@ struct DTestnetParameters {
     slow_start_interval: Option<u32>,
     target_difficulty_limit: Option<String>,
     disable_pow: Option<bool>,
+    /// Height at which the MTP-plus-90-minutes rule activates.
+    max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
     activation_heights: Option<ConfiguredActivationHeights>,
     pre_nu6_funding_streams: Option<ConfiguredFundingStreams>,
@@ -1060,6 +1067,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             slow_start_interval: Some(params.slow_start_interval().0),
             target_difficulty_limit: Some(params.target_difficulty_limit().to_string()),
             disable_pow: Some(params.disable_pow()),
+            max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
             pre_nu6_funding_streams: None,
@@ -1345,6 +1353,7 @@ where
         slow_start_interval,
         target_difficulty_limit,
         disable_pow,
+        max_block_time_start_height,
         genesis_hash,
         activation_heights,
         pre_nu6_funding_streams,
@@ -1394,6 +1403,11 @@ where
 
     if let Some(disable_pow) = disable_pow {
         params_builder = params_builder.with_disable_pow(disable_pow);
+    }
+
+    if let Some(height) = max_block_time_start_height {
+        params_builder = params_builder
+            .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
     }
 
     // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.
@@ -1470,6 +1484,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         lockbox_disbursements,
         checkpoints,
         extend_funding_stream_addresses_as_required,
+        max_block_time_start_height,
         ..
     } = params;
 
@@ -1488,6 +1503,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
         checkpoints: Some(checkpoints),
+        max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
     }
 }

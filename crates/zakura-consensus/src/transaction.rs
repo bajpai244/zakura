@@ -61,6 +61,13 @@ mod tests;
 ///     chain in the correct order.)
 const UTXO_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60);
 
+/// Maximum pending state lookups per block transaction, not across the verifier.
+///
+/// Concurrent lookups start their timeout clocks together. During out-of-order sync,
+/// a later input can therefore time out sooner than with serial lookups. The existing
+/// sync restart recovers missing ancestors, as described on `UTXO_LOOKUP_TIMEOUT`.
+const MAX_CONCURRENT_UTXO_LOOKUPS: usize = 64;
+
 /// A timeout applied to output lookup requests sent to the mempool. This is shorter than the
 /// timeout for the state UTXO lookups because a block is likely to be mined every 75 seconds
 /// after Blossom is active, changing the best chain tip and requiring re-verification of transactions
@@ -264,7 +271,7 @@ impl Request {
     pub fn transaction(&self) -> Arc<Transaction> {
         match self {
             Request::Block { transaction, .. } => transaction.clone(),
-            Request::Mempool { transaction, .. } => transaction.transaction.clone(),
+            Request::Mempool { transaction, .. } => transaction.transaction().clone(),
         }
     }
 
@@ -277,11 +284,19 @@ impl Request {
     }
 
     /// The unmined transaction ID for the transaction in this request.
+    ///
+    /// The shielded verification cache keys its entries on this ID, so it must always be derived
+    /// from the transaction carried here. A witnessed ID's authorizing-data digest is what commits
+    /// the key to the proofs and signatures; keying on a mined ID instead would let a transaction
+    /// be answered from the cached verification of a differently-signed twin. Both arms below
+    /// recompute the ID, and the `Request::Block::transaction_hash` field the caller supplies is
+    /// deliberately not used.
     pub fn tx_id(&self) -> UnminedTxId {
         match self {
-            // TODO: get the precalculated ID from the block verifier
+            // TODO: get the precalculated ID from the block verifier. It must be a full unmined
+            // ID recomputed from the transaction, for the reason given above.
             Request::Block { transaction, .. } => transaction.unmined_id(),
-            Request::Mempool { transaction, .. } => transaction.id,
+            Request::Mempool { transaction, .. } => transaction.id(),
         }
     }
 
@@ -291,7 +306,7 @@ impl Request {
             Request::Block {
                 transaction_hash, ..
             } => *transaction_hash,
-            Request::Mempool { transaction, .. } => transaction.id.mined_id(),
+            Request::Mempool { transaction, .. } => transaction.id().mined_id(),
         }
     }
 
@@ -360,7 +375,7 @@ impl Response {
     pub fn tx_id(&self) -> UnminedTxId {
         match self {
             Response::Block { tx_id, .. } => *tx_id,
-            Response::Mempool { transaction, .. } => transaction.transaction.id,
+            Response::Mempool { transaction, .. } => transaction.transaction.id(),
         }
     }
 
@@ -430,6 +445,10 @@ where
 
         let tx = req.transaction();
         let tx_id = req.tx_id();
+        let wtx_id = match tx_id {
+            UnminedTxId::Witnessed(wtx_id) => Some(wtx_id),
+            UnminedTxId::Legacy(_) => None,
+        };
         let span = tracing::debug_span!("tx", ?tx_id);
 
         async move {
@@ -565,7 +584,7 @@ where
                 let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
                 let unpaid_actions = transaction::zip317::unpaid_actions(unmined_tx, fee);
 
-                transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size)?;
+                transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
             }
 
@@ -589,6 +608,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     joinsplit_data,
+                    tx_id,
                 )?,
                 Transaction::V5 {
                     ..
@@ -597,6 +617,7 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
+                    wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
                 )?,
                 Transaction::V6 {
                     ..
@@ -605,6 +626,7 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
+                    wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 )?,
             };
 
@@ -777,6 +799,7 @@ where
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
+        let mut block_outpoints_to_lookup = Vec::new();
 
         for (input_idx, input) in inputs.iter().enumerate() {
             if let transparent::Input::PrevOut { outpoint, .. } = input {
@@ -803,26 +826,64 @@ where
 
                     utxo
                 } else {
-                    let response = state
-                        .clone()
-                        .oneshot(zakura_state::Request::AwaitUtxo(*outpoint))
-                        .await
-                        .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
-                            Ok(_) => TransactionError::TransparentInputNotFound,
-                            Err(boxed_error) => TransactionError::from(boxed_error),
-                        })?;
-
-                    if let zakura_state::Response::Utxo(utxo) = response {
-                        utxo
-                    } else {
-                        unreachable!("AwaitUtxo always responds with Utxo")
-                    }
+                    block_outpoints_to_lookup.push((input_idx, *outpoint));
+                    continue;
                 };
                 tracing::trace!(?utxo, "got UTXO");
                 spent_outputs[input_idx] = Some(utxo.output.clone());
                 spent_utxos.insert(*outpoint, utxo);
             } else {
                 continue;
+            }
+        }
+
+        if !block_outpoints_to_lookup.is_empty() {
+            let single_lookup = block_outpoints_to_lookup.len() == 1;
+            // The verifier keeps one pending admission wait per transaction and overlaps responses.
+            // Queuing 64 readiness waits per transaction delays unrelated state requests.
+            #[allow(clippy::async_yields_async)] // Admission and response need separate awaits.
+            let lookups =
+                futures::stream::iter(block_outpoints_to_lookup)
+                    .then(move |(input_idx, outpoint)| {
+                        let mut state = state.clone();
+                        async move {
+                            let response = state
+                                .ready()
+                                .await
+                                .map(|state| state.call(zs::Request::AwaitUtxo(outpoint)));
+                            async move {
+                                let response = match response {
+                                    Ok(response) => response.await,
+                                    Err(error) => Err(error),
+                                }
+                                .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
+                                    Ok(_) => TransactionError::TransparentInputNotFound,
+                                    Err(boxed_error) => TransactionError::from(boxed_error),
+                                })?;
+
+                                let zs::Response::Utxo(utxo) = response else {
+                                    unreachable!("AwaitUtxo always responds with Utxo")
+                                };
+                                Ok::<_, TransactionError>((input_idx, outpoint, utxo))
+                            }
+                        }
+                    })
+                    .boxed();
+            // A single lookup cannot overlap another lookup, so skip the concurrency queue.
+            let lookups = if single_lookup {
+                lookups.then(std::convert::identity).left_stream()
+            } else {
+                lookups
+                    .buffer_unordered(MAX_CONCURRENT_UTXO_LOOKUPS)
+                    .right_stream()
+            };
+            futures::pin_mut!(lookups);
+
+            while let Some(result) = lookups.next().await {
+                let (input_idx, outpoint, utxo) = result?;
+                tracing::trace!(?utxo, "got UTXO");
+                spent_outputs[input_idx] = Some(utxo.output.clone());
+                spent_utxos.insert(outpoint, utxo);
             }
         }
 
@@ -911,6 +972,7 @@ where
     /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the Sprout `joinsplit_data` shielded data in the transaction
     /// - the `sapling_shielded_data` in the transaction
+    /// - the transaction's precomputed `tx_id`, used by the Sapling cache
     #[allow(clippy::unwrap_in_result)]
     fn verify_v4_transaction(
         request: &Request,
@@ -918,6 +980,7 @@ where
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
         joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let tx = request.transaction();
         let nu = request.upgrade(network);
@@ -936,7 +999,7 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sprout_shielded_data(joinsplit_data, &sighash)?)
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash)))
+        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash, tx_id)))
     }
 
     /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
@@ -1001,14 +1064,14 @@ where
     /// - the `network` to consider when verifying
     /// - the `script_verifier` to use for verifying the transparent transfers
     /// - the prepared `cached_ffi_transaction` used by the script verifier
-    /// - the sapling shielded data of the transaction, if any
-    /// - the orchard shielded data of the transaction, if any
+    /// - the transaction's precomputed `wtx_id`, used by the Halo2 cache
     #[allow(clippy::unwrap_in_result)]
     fn verify_v5_transaction(
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
         let nu = request.upgrade(network);
@@ -1027,8 +1090,17 @@ where
             script_verifier,
             cached_ffi_transaction,
         )?
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu)))
+        .and(Self::verify_sapling_bundle(
+            sapling_bundle,
+            &sighash,
+            UnminedTxId::Witnessed(wtx_id),
+        ))
+        .and(Self::verify_orchard_bundle(
+            orchard_bundle,
+            &sighash,
+            nu,
+            wtx_id,
+        )))
     }
 
     /// Verifies if a V5 `transaction` is supported by `network_upgrade`.
@@ -1079,6 +1151,7 @@ where
         network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
         let nu = request.upgrade(network);
@@ -1098,9 +1171,23 @@ where
             script_verifier,
             cached_ffi_transaction,
         )?
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu))
-        .and(Self::verify_orchard_bundle(ironwood_bundle, &sighash, nu)))
+        .and(Self::verify_sapling_bundle(
+            sapling_bundle,
+            &sighash,
+            UnminedTxId::Witnessed(wtx_id),
+        ))
+        .and(Self::verify_orchard_bundle(
+            orchard_bundle,
+            &sighash,
+            nu,
+            wtx_id,
+        ))
+        .and(Self::verify_orchard_bundle(
+            ironwood_bundle,
+            &sighash,
+            nu,
+            wtx_id,
+        )))
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
@@ -1219,9 +1306,13 @@ where
     }
 
     /// Verifies a transaction's Sapling shielded data.
+    ///
+    /// `tx_id` identifies the transaction containing `bundle`; the cache adds it to the key that
+    /// lets a mempool verification be reused for the block that mines it.
     fn verify_sapling_bundle(
         bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
+        tx_id: UnminedTxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
 
@@ -1276,7 +1367,7 @@ where
             async_checks.push(
                 primitives::sapling::VERIFIER
                     .clone()
-                    .oneshot(primitives::sapling::Item::new(bundle, *sighash)),
+                    .oneshot(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
             );
         }
 
@@ -1298,10 +1389,15 @@ where
     /// [`primitives::halo2::verifier_for`] maps the upgrade to
     /// the verifier holding the matching key; the verifiers keep separate
     /// batches, so eras are never mixed.
+    ///
+    /// `wtx_id` identifies the transaction containing `bundle`; the cache adds
+    /// the bundle's value pool to distinguish the Orchard and Ironwood slots in
+    /// a v6 transaction.
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
         network_upgrade: NetworkUpgrade,
+        wtx_id: transaction::WtxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
 
@@ -1326,7 +1422,9 @@ where
             async_checks.push(
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()
-                    .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
+                    .oneshot(primitives::halo2::Item::new_with_wtx_id(
+                        bundle, *sighash, wtx_id,
+                    )),
             );
         }
 

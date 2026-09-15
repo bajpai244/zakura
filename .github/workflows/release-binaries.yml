@@ -294,7 +294,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -332,9 +332,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
           SKIP_VERSION_CHECK: ${{ inputs.skip_version_check }}
+          RELEASE_BINARY: ${{ env.release_binary }}
         run: |
           set -euo pipefail
-          version_output="$(./out/usr/local/bin/${{ env.release_binary }} --version)"
+          version_output="$("./out/usr/local/bin/${RELEASE_BINARY}" --version)"
           echo "$version_output"
 
           if [ "$SKIP_VERSION_CHECK" = "true" ]; then
@@ -474,7 +475,10 @@ jobs:
       # the canonical public repository; private rehearsal repos skip it.
       - name: Attest build provenance
         if: ${{ github.repository == 'zakura-core/zakura' }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 #v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 #v4.2.2
+        env:
+          # Preserve the response-header limit set by the former wrapper.
+          NODE_OPTIONS: --max-http-header-size=32768
         with:
           subject-path: |
             ./publish/final/zakurad-*.tar.gz
@@ -581,7 +585,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -615,10 +619,11 @@ jobs:
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
           IMAGE_TAG: zakuracore/zakura:release-ci-${{ matrix.name }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
-          image_version="${{ needs.resolve-release.outputs.release_tag }}"
+          image_version="${RELEASE_TAG}"
           image_version="${image_version#v}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
@@ -673,7 +678,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.3.0
 
       - name: Create and verify Docker manifest
         env:
@@ -723,7 +728,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -766,10 +771,11 @@ jobs:
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
           IMAGE_TAG: zakuracore/zakura:zcashd-compat-release-ci-${{ matrix.name }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
-          image_version="${{ needs.resolve-release.outputs.release_tag }}"
+          image_version="${RELEASE_TAG}"
           image_version="${image_version#v}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
@@ -826,7 +832,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.3.0
 
       - name: Create and verify zcashd compat Docker manifest
         env:
@@ -875,7 +881,7 @@ jobs:
     timeout-minutes: 1
     steps:
       - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 #v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
           allowed-skips: build-zakurad-assets,publish-zakurad-assets,publish-docker-manifest,publish-zcashd-compat-docker-manifest

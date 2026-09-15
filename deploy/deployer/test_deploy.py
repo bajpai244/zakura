@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -117,7 +118,39 @@ class BuildCacheTests(unittest.TestCase):
             })
 
 
-class MountRenderingTests(unittest.TestCase):
+class MainnetWorkflowSuppressionTests(unittest.TestCase):
+    def test_suppression_is_scoped_to_compatibility_restarts(self):
+        workflow = (
+            SCRIPT_DIR.parent.parent
+            / ".github/workflows/zakura-mainnet-deploy.yml"
+        ).read_text()
+        suppression_step = workflow.split(
+            "      - name: Suppress compatibility watchdog alerts during deploy\n",
+            1,
+        )[1].split("      - name: Deploy fleet\n", 1)[0]
+
+        self.assertIn(
+            "inputs.node == '' || inputs.node == 'zakura-compat'",
+            suppression_step,
+        )
+        self.assertIn("!inputs.no_restart", suppression_step)
+        self.assertIn("root@159.203.113.196", suppression_step)
+        self.assertIn(
+            "/run/zakura-watchdog/deployment-suppressed-until",
+            suppression_step,
+        )
+        self.assertIn(
+            "if ! timeout --signal=TERM --kill-after=5s 60s \\",
+            suppression_step,
+        )
+        self.assertIn("systemctl restart zakura-watchdog", suppression_step)
+        self.assertIn("continuing deploy", suppression_step)
+        self.assertNotIn("tomllib", suppression_step)
+
+
+class NodeBuilder:
+    """Shared minimal node fixture for the rendering tests."""
+
     def node(self, **overrides):
         data = {
             "name": "node-a",
@@ -139,6 +172,7 @@ class MountRenderingTests(unittest.TestCase):
             "storage_mode": "archive",
             "p2p_stack": "dual",
             "metrics_endpoint": "",
+            "health_listen_addr": "",
             "tracing_filter": "",
             "checkpoint_sync": True,
             "vct_fast_sync": True,
@@ -151,6 +185,8 @@ class MountRenderingTests(unittest.TestCase):
         data.update(overrides)
         return deploy.Node(**data)
 
+
+class MountRenderingTests(NodeBuilder, unittest.TestCase):
     def test_render_service_requires_data_mount_for_data_paths(self):
         service = deploy.render_service(self.node(
             state_cache_dir="/mnt/data/zakura-cache",
@@ -165,6 +201,71 @@ class MountRenderingTests(unittest.TestCase):
 
         self.assertNotIn("RequiresMountsFor=/mnt/data", service)
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
+
+
+class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
+    """The [metrics] and [health] sections are opt-in and must round-trip as TOML."""
+
+    def test_endpoints_render_when_configured(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            metrics_endpoint="127.0.0.1:9999",
+            health_listen_addr="127.0.0.1:8080",
+        )))
+
+        self.assertEqual(config["metrics"], {"endpoint_addr": "127.0.0.1:9999"})
+        self.assertEqual(config["health"], {"listen_addr": "127.0.0.1:8080"})
+
+    def test_endpoints_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("metrics", config)
+        self.assertNotIn("health", config)
+
+    def test_health_renders_independently_of_metrics(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            health_listen_addr="127.0.0.1:8080",
+        )))
+
+        self.assertNotIn("metrics", config)
+        self.assertEqual(config["health"], {"listen_addr": "127.0.0.1:8080"})
+
+
+class ConfigKeyTests(unittest.TestCase):
+    def write_config(self, tmp: str, body: str) -> Path:
+        path = Path(tmp) / "nodes.toml"
+        path.write_text(body)
+        return path
+
+    def test_health_listen_addr_is_a_known_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                health_listen_addr = "127.0.0.1:8080"
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            nodes = deploy.load_nodes(path, None)
+
+            self.assertEqual(nodes[0].health_listen_addr, "127.0.0.1:8080")
+
+    def test_unknown_key_still_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                health_listen_address = "127.0.0.1:8080"
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            with self.assertRaises(deploy.DeployError):
+                deploy.load_nodes(path, None)
 
 
 if __name__ == "__main__":

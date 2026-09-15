@@ -23,7 +23,7 @@ use zakura_network::{
         ADDR_RESPONSE_LIMIT_DENOMINATOR, DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK,
     },
     types::{MetaAddr, PeerServices},
-    AddressBook, InventoryResponse, Request, Response,
+    AddressBook, InventoryResponse, PeerSocketAddr, Request, Response,
 };
 use zakura_node_services::mempool;
 use zakura_rpc::SubmitBlockChannel;
@@ -32,6 +32,7 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
     components::{
+        auth_download_height::poison_coinbase_height,
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{
             downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, run_mempool_transaction_id_gossip,
@@ -45,13 +46,14 @@ use crate::{
 
 use InventoryResponse::*;
 
-/// Maximum time to wait for a network service request.
+/// How long the mock peer set waits for an expected request before panicking.
 ///
-/// The default [`MockService`] value can be too short for some of these tests that take a little
-/// longer than expected to actually send the network request.
-///
-/// Increasing this value causes the tests to take longer to complete, so it can't be too large.
-const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_millis(500);
+/// Must comfortably exceed [`PEER_GOSSIP_DELAY`]: after that sleep the gossip task still needs a tip
+/// change notification and a short submission delay before it advertises. A tight 500ms bound
+/// races under CI scheduling and fails with `timeout while waiting for a request` even though the
+/// advertise would arrive a moment later. The dedicated gossip tests use the same 30s budget;
+/// with a paused runtime the extra headroom does not slow the happy path.
+const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 async fn wait_for_gossip() {
     // Let background gossip tasks arm their timers before this paused runtime
@@ -79,7 +81,8 @@ async fn mempool_requests_for_transactions() {
         .iter()
         .map(|t| t.transaction.clone())
         .collect();
-    let added_transaction_ids: Vec<UnminedTxId> = added_transactions.iter().map(|t| t.id).collect();
+    let added_transaction_ids: Vec<UnminedTxId> =
+        added_transactions.iter().map(UnminedTx::id).collect();
 
     // Test `Request::MempoolTransactionIds`
     let response = inbound_service
@@ -907,6 +910,116 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
+/// Test that a gossiped block with a rewritten coinbase height scores its supplying peer, and
+/// that the block is re-requested instead of being left for the syncer.
+///
+/// This pins the *consumer* side of the check. `Inbound::poll_ready` identifies the rejection by
+/// downcasting the boxed error to [`GossipedTipChildHeightMismatch`], so it depends on the inbound
+/// downloader passing that error through unwrapped. If it were ever wrapped in context — the way
+/// the syncer wraps its errors into `BlockDownloadVerifyError` — the downcast would silently stop
+/// matching, scoring would stop, and every other test would stay green.
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        mut peer_set,
+        state_service,
+        _chain_tip_change,
+        _sync_gossip_task_handle,
+        _tx_gossip_task_handle,
+        mut misbehavior_rx,
+    ) = setup_with_misbehavior_receiver(false).await;
+
+    // `setup` commits genesis and block 1, so block 2 is the tip child. Rewriting only its
+    // coinbase height leaves the header, and therefore the block hash, untouched.
+    let canonical: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let block_hash = canonical.hash();
+
+    let poisoned = poison_coinbase_height(&canonical, Height(1));
+    assert_eq!(
+        poisoned.hash(),
+        block_hash,
+        "the poisoned body still answers for the advertised hash"
+    );
+
+    let advertiser_addr: PeerSocketAddr = "127.0.0.1:8233".parse()?;
+
+    let _request = inbound_service
+        .clone()
+        .oneshot(Request::AdvertiseBlock(
+            block_hash,
+            Some(zakura_network::PeerSource::LegacySocket(advertiser_addr)),
+        ))
+        .await?;
+
+    // A download with a known source routes back to that source.
+    peer_set
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: iter::once(block_hash).collect(),
+            source: zakura_network::PeerSource::LegacySocket(advertiser_addr),
+        })
+        .await
+        .respond(Response::Blocks(vec![Available((
+            poisoned,
+            Some(advertiser_addr),
+        ))]));
+
+    // The score is sent from `Inbound::poll_ready`, which drains the finished download tasks.
+    // The buffered service only polls its inner service when it has work, so drive it with a
+    // cheap request until the report lands.
+    let mut report = None;
+    for _ in 0..50 {
+        let _ = inbound_service
+            .clone()
+            .oneshot(Request::MempoolTransactionIds)
+            .await;
+
+        if let Ok(received) = timeout(Duration::from_millis(100), misbehavior_rx.recv()).await {
+            report = Some(received);
+            break;
+        }
+    }
+    let report = report.expect("a poisoned gossip block must score its advertiser");
+
+    assert_eq!(
+        report,
+        Some((advertiser_addr, 100)),
+        "the advertiser of a poisoned tip child must be scored for a ban"
+    );
+
+    // The poisoned block must not reach the state.
+    let response = state_service
+        .clone()
+        .oneshot(zakura_state::Request::Depth(block_hash))
+        .await?;
+    assert_eq!(response, zakura_state::Response::Depth(None));
+
+    // The block must also be re-requested, without a download source, so it routes through the
+    // peer set rather than back to the peer that just poisoned it. Honest peers' `inv`s for this
+    // hash were already dropped as `AlreadyQueued` while the poisoned download was outstanding,
+    // so without this the block would wait for the syncer's next round.
+    //
+    // The replacement body is canonical, so the block reaches the verifier. This test stops at
+    // the download layer and deliberately does not assert the block commits: `setup` uses a real
+    // verifier, and on Mainnet the next checkpoint after 0 is height 400, so block 2 parks in the
+    // checkpoint verifier until the whole 2..=400 range arrives. `setup` also commits genesis and
+    // block 1 with `CommitCheckpointVerifiedBlock`, bypassing the verifier, so it never sees the
+    // start of that range either. Committing here is unreachable, not merely slow.
+    peer_set
+        .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Response::Blocks(vec![Available((canonical, None))]));
+
+    tx_verifier.expect_no_requests().await;
+
+    Ok(())
+}
+
 /// Test that the inbound downloader rejects blocks above the lookahead limit.
 ///
 /// TODO: also test that it rejects blocks behind the tip limit. (Needs ~100 fake blocks.)
@@ -1041,7 +1154,9 @@ async fn caches_getaddr_response() {
 
         // UTXO verification doesn't matter for these tests.
         let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
-            zakura_state::init(state_config.clone(), &network, Height::MAX, 0).await;
+            zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+                .await
+                .expect("ephemeral state initialization succeeds");
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1150,6 +1265,58 @@ async fn setup(
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
 ) {
+    let (
+        inbound_service,
+        mempool_service,
+        committed_blocks,
+        added_transactions,
+        mock_tx_verifier,
+        peer_set,
+        state_service,
+        chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+        _misbehavior_rx,
+    ) = setup_with_misbehavior_receiver(add_transactions).await;
+
+    (
+        inbound_service,
+        mempool_service,
+        committed_blocks,
+        added_transactions,
+        mock_tx_verifier,
+        peer_set,
+        state_service,
+        chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    )
+}
+
+/// [`setup`], additionally returning the receiver for peer misbehavior reports.
+///
+/// Tests that assert on peer scoring need the receiver; everything else uses [`setup`].
+async fn setup_with_misbehavior_receiver(
+    add_transactions: bool,
+) -> (
+    Buffer<
+        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
+        zakura_network::Request,
+    >,
+    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Vec<Arc<Block>>,
+    Vec<VerifiedUnminedTx>,
+    MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
+    MockService<Request, Response, PanicAssertion>,
+    Buffer<
+        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
+        zakura_state::Request,
+    >,
+    ChainTipChange,
+    JoinHandle<Result<(), BlockGossipError>>,
+    JoinHandle<Result<(), BoxError>>,
+    tokio::sync::mpsc::Receiver<(PeerSocketAddr, u32)>,
+) {
     let _init_guard = zakura_test::init();
 
     let network = Mainnet;
@@ -1165,8 +1332,10 @@ async fn setup(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config.clone(), &network, Height::MAX, 0).await;
+    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+        zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1245,6 +1414,7 @@ async fn setup(
         false,
         buffered_peer_set.clone(),
         state_service.clone(),
+        tower::util::BoxCloneService::new(read_only_state_service),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1313,7 +1483,7 @@ async fn setup(
     let inbound_service = BoxService::new(inbound_service);
     let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
 
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (misbehavior_sender, misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book,
         block_download_peer_set: buffered_peer_set,
@@ -1338,6 +1508,7 @@ async fn setup(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        misbehavior_rx,
     )
 }
 

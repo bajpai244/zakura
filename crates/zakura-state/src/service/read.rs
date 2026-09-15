@@ -16,6 +16,7 @@ use crate::service;
 
 pub mod address;
 pub mod block;
+pub mod chain_tips;
 pub mod difficulty;
 pub mod find;
 pub mod historical_tree;
@@ -38,16 +39,24 @@ pub use block::{
 #[cfg(feature = "indexer")]
 pub use block::spending_transaction_hash;
 
+pub use chain_tips::{chain_tips, ChainTipInfo, ChainTipStatus, SelectedHeaders};
+
 pub use find::{
     best_tip, block_locator, depth, finalized_state_contains_block_hash, find_chain_hashes,
     find_chain_headers, hash_by_height, height_by_hash, next_median_time_past,
     non_finalized_state_contains_block_hash, tip, tip_height, tip_with_value_balance,
 };
 pub use historical_tree::{
-    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
+    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_CACHED_FRONTIERS,
+};
+pub(crate) use tree::{
+    check_historical_ironwood_subtrees_available, check_historical_orchard_subtrees_available,
+    check_historical_sapling_subtrees_available, ironwood_subtrees_with_gaps,
+    orchard_subtrees_with_gaps, sapling_subtrees_with_gaps,
 };
 pub use tree::{
-    ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree, sapling_subtrees,
+    contiguous_subtrees_from, ironwood_subtrees, ironwood_tree, merge_published_subtrees,
+    orchard_subtrees, orchard_tree, retain_subtrees_completed_at_or_below, sapling_subtrees,
     sapling_tree,
 };
 

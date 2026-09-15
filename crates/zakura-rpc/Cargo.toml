@@ -1,6 +1,6 @@
 [package]
 name = "zakura-rpc"
-version = "6.0.0"
+version = "10.0.1-rc1"
 authors.workspace = true
 description = "The Zakura node's JSON Remote Procedure Call (JSON-RPC) interface. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -27,12 +27,14 @@ exclude = ["*.proto"]
 # Production features that activate extra dependencies, or extra features in
 # dependencies
 
+# Indexer support: serve raw finalized block ranges on the indexer gRPC service
+indexer = ["zakura-state/indexer"]
+
 # Experimental internal miner support
 internal-miner = []
 
 # Test-only features
 proptest-impl = [
-    "proptest",
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",
     "zakura-network/proptest-impl",
@@ -63,6 +65,7 @@ strum_macros = { workspace = true }
 # RPC endpoint basic auth
 base64 = { workspace = true }
 rand = { workspace = true }
+rand_10 = { workspace = true }
 # Constant-time cookie comparison to prevent a timing oracle on RPC auth.
 subtle = { workspace = true }
 
@@ -101,37 +104,31 @@ sapling-crypto = { workspace = true }
 zcash_address = { workspace = true }
 zcash_keys = { workspace = true, features = ["orchard", "sapling"] }
 zcash_primitives = { workspace = true, features = ["transparent-inputs", "non-standard-fees"] }
-zcash_proofs = { workspace = true }
 zcash_protocol = { workspace = true }
 zcash_script = { workspace = true }
 zcash_transparent = { workspace = true }
 
-# Test-only feature proptest-impl
-proptest = { workspace = true, optional = true }
-
-zakura-chain = { path = "../zakura-chain", version = "4.0.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = [
     "json-conversion",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "6.0.0" }
-zakura-network = { path = "../zakura-network", version = "6.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.1.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "8.0.0" }
+zakura-network = { path = "../zakura-network", version = "8.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.4", features = [
     "rpc-client",
 ] }
-zakura-script = { path = "../zakura-script", version = "3.1.0" }
-zakura-state = { path = "../zakura-state", version = "6.0.0" }
-rustls = "0.23.40"
-tokio-rustls = "0.26.4"
-
-[build-dependencies]
-openrpsee = { workspace = true }
-tonic-prost-build = { workspace = true }
-which = { workspace = true }
+zakura-script = { path = "../zakura-script", version = "3.2.3" }
+zakura-state = { path = "../zakura-state", version = "8.1.0" }
+rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
+# Only used to read the validity dates of the configured RPC TLS certificates.
+der = "0.7.10"
 
 [dev-dependencies]
 bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["redactions", "json", "ron"] }
 anyhow = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tempfile = { workspace = true }
 toml = { workspace = true }
 
@@ -139,16 +136,16 @@ proptest = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "4.0.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = [
     "proptest-impl",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "6.0.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "8.0.0", features = [
     "proptest-impl",
 ] }
-zakura-network = { path = "../zakura-network", version = "6.0.0", features = [
+zakura-network = { path = "../zakura-network", version = "8.0.0", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "6.0.0", features = [
+zakura-state = { path = "../zakura-state", version = "8.1.0", features = [
     "proptest-impl",
 ] }
 

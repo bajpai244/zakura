@@ -48,7 +48,7 @@ pub struct Config {
     /// Storage mode is controlled separately by [`storage_mode`](Config::storage_mode).
     ///
     /// The default directory is platform dependent, based on
-    /// [`dirs::cache_dir()`](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
+    /// [the platform cache directory](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
     ///
     /// |Platform | Value                                           | Example                              |
     /// | ------- | ----------------------------------------------- | ------------------------------------ |
@@ -102,20 +102,21 @@ pub struct Config {
     ///       Zebra's last non-finalized state before it shut down.
     pub should_backup_non_finalized_state: bool,
 
-    /// Whether to audit and repair the Zakura header store when the state database opens.
+    /// Legacy compatibility switch for the retired opt-in header-store repair.
     ///
-    /// Set to `false` by default. When this is `true`, writable state opens scan
-    /// the full Zakura header-store frontier and delete any incoherent suffix or
-    /// stale committed-height rows so header sync can re-download them. This can
-    /// be expensive while syncing from genesis, because the header frontier can
-    /// contain millions of rows above the finalized tip.
+    /// Native header-runtime attachment always performs its required startup audit.
+    /// Attachment also always performs reconstruction.
+    /// Earlier Zakura releases wrote this field to configuration files.
+    /// State keeps deserializing the field for compatibility.
+    /// State no longer serializes the field.
+    #[serde(skip_serializing)]
     pub repair_zakura_header_store_on_startup: bool,
 
-    /// Whether committed full blocks should seed the Zakura header-only store.
+    /// Whether this process runs the native Zakura header runtime.
     ///
-    /// This is enabled by zakurad only for the Zakura v2 path. It is skipped in
-    /// serde so the generic Zebra state config does not expose a Zakura-specific
-    /// user setting.
+    /// `zakurad` enables this only when the selected P2P stack includes Zakura v2.
+    /// `network.p2p_stack` owns this choice.
+    /// State does not expose a separate user-facing option.
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 
@@ -144,6 +145,19 @@ pub struct Config {
     /// as an independent state setting.
     #[serde(skip)]
     pub vct_fast_sync: bool,
+
+    /// Optional path to a frontier artifact used to anchor historical tree derivation.
+    ///
+    /// Mainnet's reviewed frontier grid is embedded in the binary, so the default `None` uses that
+    /// grid without deployment-time configuration. Setting a path overrides the embedded grid,
+    /// primarily for tests and custom networks. The artifact holds note commitment frontiers at a
+    /// sparse height grid, so a cold request replays from the nearest grid entry rather than from
+    /// genesis. Every entry is checked against the authenticated root this node already stores
+    /// before it is used, so a corrupt or hostile artifact is rejected rather than absorbed.
+    ///
+    /// Completed subtree roots need no equivalent setting: they ship embedded in the binary and
+    /// are loaded without operator configuration.
+    pub historical_frontier_artifact: Option<PathBuf>,
 
     /// Whether to delete the old database directories when present.
     ///
@@ -295,6 +309,26 @@ impl Config {
 
         Ok(())
     }
+
+    /// Whether this node rebuilds historical note commitment trees on demand for RPC queries.
+    ///
+    /// True when an archive node either currently uses the verified-commitment-trees fast path or
+    /// has a durable marker showing that its database previously completed a VCT fast sync. The
+    /// marker keeps an existing absent tree band serviceable after sync settings change. A legacy
+    /// database has no marker, so disabling either setting keeps derivation off.
+    ///
+    /// This is derived rather than configured because it grants no capability an operator needs to
+    /// weigh: a derived frontier is served only when it reproduces the authenticated root this node
+    /// already stores, so the answer is verified rather than trusted, and a node that can answer a
+    /// treestate query correctly has no reason to refuse it. What an operator does choose is the
+    /// cost bound: derivation anchors on the embedded Mainnet grid or the
+    /// [`Self::historical_frontier_artifact`] override, and
+    /// [`crate::MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] bounds it from both ends, refusing a grid whose
+    /// gaps are too wide at startup and a request that would replay too far at serving time.
+    pub fn derive_historical_trees(&self, database_was_vct_fast_synced: bool) -> bool {
+        self.pruning_config().is_none()
+            && ((self.checkpoint_sync && self.vct_fast_sync) || database_was_vct_fast_synced)
+    }
 }
 
 /// Selects whether Zebra keeps all historical block data, or stores only the data
@@ -430,6 +464,7 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            historical_frontier_artifact: None,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
@@ -449,9 +484,17 @@ mod tests {
             Config::default().vct_fast_sync,
             "VCT fast sync is enabled by default when checkpoint sync and embedded frontiers are available"
         );
+        assert!(!Config::default().repair_zakura_header_store_on_startup);
+
+        let legacy_repair: Config =
+            toml::from_str(r#"repair_zakura_header_store_on_startup = true"#)
+                .expect("legacy startup repair config remains parseable");
+        assert!(legacy_repair.repair_zakura_header_store_on_startup);
         assert!(
-            !Config::default().repair_zakura_header_store_on_startup,
-            "Zakura header-store startup repair is opt-in because it scans the full header frontier"
+            !toml::to_string(&legacy_repair)
+                .expect("state config serializes")
+                .contains("repair_zakura_header_store_on_startup"),
+            "retired startup repair config is not emitted in new configs"
         );
 
         let archive: Config = toml::from_str(r#"storage_mode = "archive""#)
@@ -477,11 +520,6 @@ mod tests {
             "archive mode must not silently ignore pruned-only or misspelled settings"
         );
 
-        let repair_enabled: Config =
-            toml::from_str(r#"repair_zakura_header_store_on_startup = true"#)
-                .expect("startup repair config deserializes from a bool");
-        assert!(repair_enabled.repair_zakura_header_store_on_startup);
-
         let pruned: Config = toml::from_str(r#"storage_mode = "pruned""#)
             .expect("pruned storage mode deserializes from a string");
         assert_eq!(
@@ -506,6 +544,69 @@ mod tests {
             !serialized.contains("vct_fast_sync"),
             "vct_fast_sync is configured under [consensus], not [state]"
         );
+    }
+
+    #[test]
+    fn historical_tree_derivation_follows_storage_mode_and_vct() {
+        assert!(
+            Config::default().derive_historical_trees(false),
+            "an archive node on the VCT fast path can rebuild the trees it skipped storing"
+        );
+
+        let legacy_recompute = Config {
+            vct_fast_sync: false,
+            ..Config::default()
+        };
+        assert!(
+            !legacy_recompute.derive_historical_trees(false),
+            "a node that recomputes every per-height tree has no absent band to derive"
+        );
+        assert!(
+            legacy_recompute.derive_historical_trees(true),
+            "a durable VCT marker preserves derivation after the fast path is disabled"
+        );
+
+        let full_verification = Config {
+            checkpoint_sync: false,
+            ..Config::default()
+        };
+        assert!(
+            !full_verification.derive_historical_trees(false),
+            "without checkpoint sync the VCT mirror is inert, so no band is skipped"
+        );
+        assert!(
+            full_verification.derive_historical_trees(true),
+            "a durable VCT marker preserves derivation after checkpoint sync is disabled"
+        );
+
+        let pruned = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            ..Config::default()
+        };
+        assert!(
+            !pruned.derive_historical_trees(false),
+            "replay reads block bodies that pruned mode deletes"
+        );
+        assert!(
+            !pruned.derive_historical_trees(true),
+            "a durable VCT marker cannot make pruned block bodies available"
+        );
+    }
+
+    #[test]
+    fn retired_historical_tree_settings_are_rejected() {
+        // Both keys were only ever available in pre-release builds, so a config carrying one is a
+        // preview config that must be updated. Silently ignoring it would leave an operator
+        // believing they had turned derivation off, or capped its replay.
+        for retired in [
+            "derive_historical_trees = true",
+            "max_historical_tree_replay_blocks = 100",
+        ] {
+            assert!(
+                toml::from_str::<Config>(retired).is_err(),
+                "{retired} is no longer a state setting and must not parse"
+            );
+        }
     }
 }
 

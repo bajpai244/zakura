@@ -27,6 +27,7 @@ use crate::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
+    subtree_verify::{self, SubtreeRootsError},
 };
 
 pub mod legacy;
@@ -193,6 +194,28 @@ pub struct NoteCommitmentTree {
 }
 
 impl NoteCommitmentTree {
+    /// Wraps an existing [`Frontier`] as a note commitment tree.
+    ///
+    /// # Correctness
+    ///
+    /// [`Frontier::from_parts`] validates only that the position and ommer
+    /// count are consistent and that the frontier fits within
+    /// `MERKLE_DEPTH`. It does not verify that the nodes were derived from
+    /// note commitments or that the root belongs to an authenticated chain
+    /// and shielded pool state.
+    ///
+    /// Callers must derive the frontier from validated commitments or
+    /// authenticate its root against the expected chain and shielded pool
+    /// state before treating the resulting tree as authoritative.
+    ///
+    /// The root cache starts empty and is recomputed on first use.
+    pub fn from_frontier(frontier: Frontier<sapling_crypto::Node, MERKLE_DEPTH>) -> Self {
+        Self {
+            inner: frontier,
+            cached_root: Default::default(),
+        }
+    }
+
     /// Adds a note commitment u-coordinate to the tree.
     ///
     /// The leaves of the tree are actually a base field element, the
@@ -420,6 +443,17 @@ impl NoteCommitmentTree {
         Some((index, root))
     }
 
+    /// Checks `roots`, the completed subtree roots in index order, against this tree's frontier.
+    ///
+    /// Returns how many roots were checked. See
+    /// [`subtree_verify`](crate::subtree_verify) for what this proves.
+    pub fn verify_completed_subtree_roots(
+        &self,
+        roots: &[sapling_crypto::Node],
+    ) -> Result<usize, SubtreeRootsError> {
+        subtree_verify::verify_completed_subtree_roots(self.frontier(), roots, MERKLE_DEPTH)
+    }
+
     /// Returns the current root of the tree, used as an anchor in Sapling
     /// shielded transactions.
     pub fn root(&self) -> Root {
@@ -604,6 +638,32 @@ mod tests {
         }
 
         tree
+    }
+
+    /// A tree rebuilt from its own frontier answers exactly like the
+    /// original, and keeps appending identically.
+    #[test]
+    fn from_frontier_round_trips_root_position_and_appends() {
+        let mut original = build_tree(37);
+
+        let live = original.frontier().expect("37 appends leave a leaf");
+        let frontier = Frontier::from_parts(live.position(), *live.leaf(), live.ommers().to_vec())
+            .expect("the parts of a live frontier are valid");
+
+        let mut rebuilt = NoteCommitmentTree::from_frontier(frontier);
+
+        assert_eq!(rebuilt.root(), original.root());
+        assert_eq!(rebuilt.count(), original.count());
+        assert_eq!(rebuilt.position(), original.position());
+
+        original
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+        rebuilt
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+
+        assert_eq!(rebuilt.root(), original.root());
     }
 
     fn pre_subtree_boundary_tree() -> NoteCommitmentTree {

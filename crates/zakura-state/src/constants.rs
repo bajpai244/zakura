@@ -13,6 +13,7 @@ use crate::{
     constants,
 };
 
+pub use zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
 pub use zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 
 /// The maximum chain reorganisation height; it bounds the length of the best
@@ -38,14 +39,24 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// get the network-specific floor.
 pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
-/// The default bound on how many blocks one historical note commitment tree derivation may
-/// replay. Used as the `audit-historical-treestates` CLI default until the config knob lands.
+/// The most blocks one historical note commitment tree derivation may replay to serve a request.
 ///
-/// Sized to cover a cold request anywhere in a from-genesis fast-synced node's absent band on
-/// Mainnet, so the first request of a wallet sweep succeeds rather than failing at a limit. Later
-/// requests in the sweep replay only from the previous memoized frontier, so the bound applies to
-/// the cold case alone.
-pub const DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 4_000_000;
+/// One number bounds the cost two ways, because they are the same cost. Startup refuses a
+/// configured frontier grid whose largest cold-request gap, measured from genesis, exceeds this,
+/// and serving refuses a request that would still replay more than this. Checking only the grid
+/// would leave the request path open when entries load but fail their root checks, and checking
+/// only the request path would let a node start on a grid it can never serve from.
+///
+/// Sized to sit far above a real grid's gaps and far below the absent band it must never replay.
+/// The published Mainnet grid's largest cold request is 1,333 blocks, so this leaves roughly 75x
+/// headroom, while the band itself is ~3.4M blocks. Generation is deliberately not bounded by it:
+/// `export-historical-treestates` replays between grid targets, and the grid-free
+/// `audit-historical-treestates` walk measures the whole band on purpose.
+///
+/// Deliberately a constant rather than a setting. It bounds nothing an operator picks: the grid an
+/// operator does pick is what decides replay cost, and no value of this backstop makes a node with
+/// a gappy grid serve faster or a node with a dense one serve more.
+pub const MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 100_000;
 
 /// The minimum retention window allowed in pruned storage mode on `network`.
 ///
@@ -93,7 +104,7 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 2;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
@@ -130,17 +141,6 @@ pub(crate) const DATABASE_FORMAT_VERSION_FILE_NAME: &str = "version";
 /// time between v5 transactions.
 pub const MAX_LEGACY_CHAIN_BLOCKS: usize = 100_000;
 
-/// The maximum number of non-finalized chain forks Zebra will track.
-/// When this limit is reached, we drop the chain with the lowest work.
-///
-/// When the network is under heavy transaction load, there are around 5 active forks in the last
-/// 100 blocks. (1 fork per 20 blocks.) When block propagation is efficient, there is around
-/// 1 fork per 300 blocks.
-///
-/// This limits non-finalized chain memory, in the worst case, to around:
-/// `10 forks * 1000 blocks * 2 MB per block = 20 GB`
-pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
-
 /// The maximum number of block hashes allowed in `getblocks` responses in the Zcash network protocol.
 pub const MAX_FIND_BLOCK_HASHES_RESULTS: u32 = 500;
 
@@ -162,6 +162,9 @@ pub const MAX_HEADER_SYNC_HEIGHT_RANGE: u32 = 4000;
 pub const MAX_INVALIDATED_BLOCKS: usize = 100;
 
 lazy_static! {
-    /// Regex that matches the RocksDB error when its lock file is already open.
-    pub static ref LOCK_FILE_ERROR: Regex = Regex::new("(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)").expect("regex is valid");
+    /// Regex that matches a direct RocksDB lock error or the state initialization hint that wraps it.
+    pub static ref LOCK_FILE_ERROR: Regex = Regex::new(
+        "(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)|(database lock)"
+    )
+    .expect("regex is valid");
 }

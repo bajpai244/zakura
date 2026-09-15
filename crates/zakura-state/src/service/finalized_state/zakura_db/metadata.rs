@@ -1,7 +1,7 @@
 //! Operational metadata about node software that writes the database.
 
 use crate::service::finalized_state::{
-    disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
+    disk_db::{DiskWriteBatch, WriteDisk},
     FromDisk, IntoDisk, NODE_SOFTWARE_METADATA,
 };
 
@@ -86,15 +86,14 @@ impl DatabaseWriterMetadata {
 
 impl ZakuraDb {
     /// Records the node software that most recently opened this database writable.
-    #[allow(clippy::unwrap_in_result)]
     pub fn record_database_writer_metadata(
         &self,
         metadata: &DatabaseWriterMetadata,
-    ) -> Result<(), rocksdb::Error> {
+    ) -> Result<(), crate::BoxError> {
         let metadata_cf = self
             .db
             .cf_handle(NODE_SOFTWARE_METADATA)
-            .expect("node software metadata column family is created at startup");
+            .ok_or("node software metadata column family is missing")?;
 
         let mut batch = DiskWriteBatch::new();
         batch.zs_insert(
@@ -113,24 +112,35 @@ impl ZakuraDb {
             MetadataValue(metadata.last_known_tag.clone()),
         );
 
-        self.db.write(batch)
+        self.db.write(batch).map_err(Into::into)
     }
 
     /// Returns the recorded node software metadata, if all fields are present.
-    pub fn database_writer_metadata(&self) -> Option<DatabaseWriterMetadata> {
-        let metadata_cf = self.db.cf_handle(NODE_SOFTWARE_METADATA)?;
-
-        let software: MetadataValue = self.db.zs_get(&metadata_cf, &LAST_WRITER_SOFTWARE_KEY)?;
-        let version: MetadataValue = self.db.zs_get(&metadata_cf, &LAST_WRITER_VERSION_KEY)?;
-        let last_known_tag: MetadataValue = self
-            .db
-            .zs_get(&metadata_cf, &LAST_WRITER_LAST_KNOWN_TAG_KEY)?;
-
-        Some(DatabaseWriterMetadata::new(
+    pub fn database_writer_metadata(
+        &self,
+    ) -> Result<Option<DatabaseWriterMetadata>, rocksdb::Error> {
+        let Some(metadata_cf) = self.db.cf_handle(NODE_SOFTWARE_METADATA) else {
+            return Ok(None);
+        };
+        let read = |key: MetadataKey| {
+            self.db
+                .raw_get_cf(&metadata_cf, key.0.as_bytes())
+                .map(|value| value.map(MetadataValue::from_bytes))
+        };
+        let Some(software) = read(LAST_WRITER_SOFTWARE_KEY)? else {
+            return Ok(None);
+        };
+        let Some(version) = read(LAST_WRITER_VERSION_KEY)? else {
+            return Ok(None);
+        };
+        let Some(last_known_tag) = read(LAST_WRITER_LAST_KNOWN_TAG_KEY)? else {
+            return Ok(None);
+        };
+        Ok(Some(DatabaseWriterMetadata::new(
             software.0,
             version.0,
             last_known_tag.0,
-        ))
+        )))
     }
 }
 
@@ -185,7 +195,11 @@ mod tests {
 
         let db = open_with_metadata(&Config::ephemeral(), false, &metadata);
 
-        assert_eq!(db.database_writer_metadata(), Some(metadata));
+        assert_eq!(
+            db.database_writer_metadata()
+                .expect("metadata read succeeds"),
+            Some(metadata)
+        );
     }
 
     #[test]
@@ -202,13 +216,21 @@ mod tests {
 
         {
             let mut db = open_with_metadata(&config, false, &original);
-            assert_eq!(db.database_writer_metadata(), Some(original.clone()));
+            assert_eq!(
+                db.database_writer_metadata()
+                    .expect("metadata read succeeds"),
+                Some(original.clone())
+            );
             db.shutdown(true);
         }
 
         let db = open_with_metadata(&config, true, &attempted);
 
-        assert_eq!(db.database_writer_metadata(), Some(original));
+        assert_eq!(
+            db.database_writer_metadata()
+                .expect("metadata read succeeds"),
+            Some(original)
+        );
     }
 
     #[test]
@@ -221,21 +243,64 @@ mod tests {
             ..Config::default()
         };
         let original = DatabaseWriterMetadata::new("Zakura", "1.2.3+4.gabcdef123456", "v1.2.3");
-        let updated = DatabaseWriterMetadata::new("Zakura", "1.2.4+1.g111111111111", "v1.2.4");
+        let updated = DatabaseWriterMetadata::new("Other node", "unknown", "");
 
         {
             let mut db = open_with_metadata(&config, false, &original);
-            assert_eq!(db.database_writer_metadata(), Some(original));
+            assert_eq!(
+                db.database_writer_metadata()
+                    .expect("metadata read succeeds"),
+                Some(original)
+            );
             db.shutdown(true);
         }
 
         let db = open_with_metadata(&config, false, &updated);
 
-        assert_eq!(db.database_writer_metadata(), Some(updated));
+        assert_eq!(
+            db.database_writer_metadata()
+                .expect("metadata read succeeds"),
+            Some(updated)
+        );
+    }
+
+    #[test]
+    fn missing_metadata_cf_does_not_prevent_writable_open() {
+        let _init_guard = zakura_test::init();
+        let db = ZakuraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Network::Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .filter(|name| **name != NODE_SOFTWARE_METADATA)
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("metadata failure does not prevent database startup");
+        assert_eq!(
+            db.database_writer_metadata()
+                .expect("metadata read succeeds"),
+            None
+        );
+        assert!(db
+            .record_database_writer_metadata(&DatabaseWriterMetadata::default_zakura())
+            .is_err());
     }
 
     #[test]
     fn opening_old_database_creates_metadata_cf_and_records_writer() {
+        check_metadata_upgrade(Version::new(28, 0, 1));
+    }
+
+    #[test]
+    fn opening_previous_database_creates_metadata_cf_and_records_writer() {
+        check_metadata_upgrade(Version::new(28, 1, 5));
+    }
+
+    fn check_metadata_upgrade(old_version: Version) {
         let _init_guard = zakura_test::init();
         let tempdir = tempfile::tempdir().expect("temporary cache directory is created");
         let config = Config {
@@ -243,7 +308,6 @@ mod tests {
             ephemeral: false,
             ..Config::default()
         };
-        let old_version = Version::new(28, 0, 1);
         let metadata = DatabaseWriterMetadata::new("Zakura", "1.2.4+1.g111111111111", "v1.2.4");
 
         {
@@ -265,8 +329,27 @@ mod tests {
 
             db.update_format_version_on_disk(&old_version)
                 .expect("test database version is set to the old format");
-            assert_eq!(db.database_writer_metadata(), None);
+            assert_eq!(
+                db.database_writer_metadata()
+                    .expect("metadata read succeeds"),
+                None
+            );
             db.shutdown(true);
+        }
+
+        {
+            let db = open_with_metadata(&config, true, &metadata);
+            assert_eq!(
+                db.database_writer_metadata()
+                    .expect("metadata read succeeds"),
+                None
+            );
+            assert!(db.db.cf_handle(NODE_SOFTWARE_METADATA).is_none());
+            assert_eq!(
+                db.format_version_on_disk()
+                    .expect("version remains readable"),
+                Some(old_version)
+            );
         }
 
         let db = ZakuraDb::new_with_database_writer_metadata(
@@ -283,7 +366,11 @@ mod tests {
         )
         .expect("current database opens and upgrades from the old format");
 
-        assert_eq!(db.database_writer_metadata(), Some(metadata));
+        assert_eq!(
+            db.database_writer_metadata()
+                .expect("metadata read succeeds"),
+            Some(metadata)
+        );
         assert_eq!(
             db.format_version_on_disk()
                 .expect("version remains readable"),

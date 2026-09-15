@@ -2,8 +2,6 @@
 
 use std::{borrow::Borrow, sync::Arc};
 
-use chrono::Duration;
-
 use zakura_chain::{
     block::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
@@ -64,9 +62,31 @@ where
     C::Item: Borrow<Block>,
     C::IntoIter: ExactSizeIterator,
 {
+    block_is_valid_for_recent_chain_data(
+        &semantically_verified.block,
+        semantically_verified.height,
+        network,
+        finalized_tip_height,
+        relevant_chain,
+    )
+}
+
+/// Checks the recent-chain rules required for prepared mined-block relay.
+pub(crate) fn block_is_valid_for_recent_chain_data<C>(
+    candidate_block: &Block,
+    candidate_height: block::Height,
+    network: &Network,
+    finalized_tip_height: Option<block::Height>,
+    relevant_chain: C,
+) -> Result<(), ValidateContextError>
+where
+    C: IntoIterator,
+    C::Item: Borrow<Block>,
+    C::IntoIter: ExactSizeIterator,
+{
     let finalized_tip_height = finalized_tip_height
         .expect("finalized state must contain at least one block to do contextual validation");
-    check::block_is_not_orphaned(finalized_tip_height, semantically_verified.height)?;
+    check::block_is_not_orphaned(finalized_tip_height, candidate_height)?;
 
     let relevant_chain: Vec<_> = relevant_chain
         .into_iter()
@@ -75,7 +95,7 @@ where
 
     let Some(parent_block) = relevant_chain.first() else {
         warn!(
-            ?semantically_verified,
+            ?candidate_height,
             ?finalized_tip_height,
             "state must contain parent block to do contextual validation"
         );
@@ -87,7 +107,7 @@ where
     let parent_height = parent_block
         .coinbase_height()
         .expect("valid blocks have a coinbase height");
-    check::height_one_more_than_parent_height(parent_height, semantically_verified.height)?;
+    check::height_one_more_than_parent_height(parent_height, candidate_height)?;
 
     // skip this check during tests if we don't have enough blocks in the chain
     // process_queued also checks the chain length, so we can skip this assertion during testing
@@ -128,9 +148,10 @@ where
         )
     });
     let difficulty_adjustment =
-        AdjustedDifficulty::new_from_block(&semantically_verified.block, network, relevant_data);
+        AdjustedDifficulty::new_from_block(candidate_block, network, relevant_data)
+            .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
     check::difficulty_threshold_and_time_are_valid(
-        semantically_verified.block.header.difficulty_threshold,
+        candidate_block.header.difficulty_threshold,
         difficulty_adjustment,
     )?;
 
@@ -140,6 +161,7 @@ where
 /// Check that a header is contextually valid for `network`, using the previous
 /// header height and recent held header data.
 #[tracing::instrument(skip(candidate_header, network, relevant_headers))]
+#[cfg(test)]
 pub(crate) fn header_is_valid_for_recent_chain<C>(
     candidate_header: &block::Header,
     previous_block_height: block::Height,
@@ -159,7 +181,8 @@ where
         previous_block_height,
         network,
         relevant_headers,
-    );
+    )
+    .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
 
     check::difficulty_threshold_and_time_are_valid(
         candidate_header.difficulty_threshold,
@@ -307,85 +330,33 @@ pub(crate) fn difficulty_threshold_and_time_are_valid(
     difficulty_threshold: CompactDifficulty,
     difficulty_adjustment: AdjustedDifficulty,
 ) -> Result<(), ValidateContextError> {
-    // Check the block header time consensus rules from the Zcash specification
-    let candidate_height = difficulty_adjustment.candidate_height();
-    let candidate_time = difficulty_adjustment.candidate_time();
-    let network = difficulty_adjustment.network();
-    let median_time_past = difficulty_adjustment.median_time_past();
-    let block_time_max =
-        median_time_past + Duration::seconds(difficulty::BLOCK_MAX_TIME_SINCE_MEDIAN.into());
-
-    // # Consensus
-    //
-    // > For each block other than the genesis block, `nTime` MUST be strictly greater
-    // than the median-time-past of that block.
-    //
-    // https://zips.z.cash/protocol/protocol.pdf#blockheader
-    let genesis_height = NetworkUpgrade::Genesis
-        .activation_height(&network)
-        .expect("Zakura always has a genesis height available");
-
-    if candidate_time <= median_time_past && candidate_height != genesis_height {
-        Err(ValidateContextError::TimeTooEarly {
+    zakura_header_chain::validate_contextual_difficulty_and_time(
+        difficulty_threshold,
+        difficulty_adjustment,
+    )
+    .map_err(|error| match error {
+        zakura_header_chain::ContextualValidationError::TimeTooEarly {
             candidate_time,
             median_time_past,
-        })?
-    }
-
-    // # Consensus
-    //
-    // > For each block at block height 2 or greater on Mainnet, or block height 653_606
-    // or greater on Testnet, `nTime` MUST be less than or equal to the median-time-past
-    // of that block plus 90*60 seconds.
-    //
-    // https://zips.z.cash/protocol/protocol.pdf#blockheader
-    //
-    // Mainnet height 1 is outside this rule, and Testnet does not enforce it
-    // until height 653_606. Zebra's full-block contextual validation on Mainnet
-    // and Testnet starts after the mandatory checkpoint, so this early-chain
-    // branch is only reachable through header sync and non-checkpointed test
-    // networks, where it preserves the spec exception.
-    if candidate_height.0 >= 2
-        && network.is_max_block_time_enforced(candidate_height)
-        && candidate_time > block_time_max
-    {
-        Err(ValidateContextError::TimeTooLate {
+        } => ValidateContextError::TimeTooEarly {
+            candidate_time,
+            median_time_past,
+        },
+        zakura_header_chain::ContextualValidationError::TimeTooLate {
             candidate_time,
             block_time_max,
-        })?
-    }
-
-    // # Consensus
-    //
-    // > For a block at block height `Height`, `nBits` MUST be equal to `ThresholdBits(Height)`.
-    //
-    // https://zips.z.cash/protocol/protocol.pdf#blockheader
-    //
-    // On networks with proof-of-work disabled, the semantic PoW check in
-    // zakura-consensus is already skipped, so we also relax this contextual
-    // difficulty-adjustment check: a single node mining on a custom
-    // PoW-disabled network (e.g. a mainnet shadow-fork) declares a difficulty
-    // that cannot match the expectation derived from the grafted history. We
-    // still require the declared difficulty to be representable as work -- the
-    // equality check guaranteed this on PoW networks -- otherwise computing the
-    // chain's cumulative work later panics (`to_work().expect`), which a
-    // crafted block could use to crash the node.
-    let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
-    if network.disable_pow() {
-        if difficulty_threshold.to_work().is_none() {
-            Err(ValidateContextError::InvalidDifficultyThreshold {
-                difficulty_threshold,
-                expected_difficulty,
-            })?
-        }
-    } else if difficulty_threshold != expected_difficulty {
-        Err(ValidateContextError::InvalidDifficultyThreshold {
+        } => ValidateContextError::TimeTooLate {
+            candidate_time,
+            block_time_max,
+        },
+        zakura_header_chain::ContextualValidationError::InvalidDifficultyThreshold {
             difficulty_threshold,
             expected_difficulty,
-        })?
-    }
-
-    Ok(())
+        } => ValidateContextError::InvalidDifficultyThreshold {
+            difficulty_threshold,
+            expected_difficulty,
+        },
+    })
 }
 
 /// Check if zebra is following a legacy chain and return an error if so.

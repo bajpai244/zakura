@@ -20,14 +20,14 @@ policy) is plumbing around that invariant. A root that cannot be obtained or ver
 never guessed: while VCT fast sync is using verified roots below the last checkpoint, the committer
 stops and retries rather than recomputing from a stale frontier (§8).
 
-> **Root persistence is authenticated.** Peer-supplied roots are no longer written to the
-> database when their header range commits. The header-sync reactor retains each
-> root-carrying payload in memory, state authenticates it against the canonical header chain
-> behind a durable ascending frontier (`AuthenticateHeaderRoots`), and only the verified
-> prefix enters the authoritative `commitment_roots_by_height` index. That lane is specified
-> in [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md); this
-> document describes the surrounding VCT fast-sync machinery and reflects the
-> authenticated-root behavior.
+> **Root persistence is authenticated.** Peer-supplied roots are never written to the
+> authoritative `commitment_roots_by_height` index unauthenticated. On the fork-aware header
+> chain each root arrives as a hash-keyed auxiliary delivery on its header's DAG node, is
+> authenticated against the one-header-later commitment that proves it (§6.0 as headers
+> arrive, and again at commit in §6), and only reaches the index through a committed body.
+> The superseded ascending-frontier lane (`AuthenticateHeaderRoots`), which keyed roots by
+> height instead of by header hash, is **removed**; it is specified for historical reference in
+> [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md).
 
 **Data flow (fetch + commit path):**
 
@@ -39,9 +39,9 @@ header sync (runs ahead of bodies)
 header-sync reactor (zakura-network): validate root count + per-height alignment; reject
    │ unrequested or non-finalized roots as MalformedMessage (§8.1)
    ▼
-CommitHeaderRange (zakura-state): commit the headers; the reactor retains the root payload
-   │ until state authenticates it (AuthenticateHeaderRoots) and persists the verified prefix
-   │ into commitment_roots_by_height, ahead of body commit (§4.2)
+InsertHeaders (zakura-state): commit the headers and their hash-keyed auxiliary deliveries
+   │ into the header-chain DAG, then authenticate each delivery against its successor
+   │ header as soon as that successor is selected (§6.0), evicting a failing one at once
    ▼
 PeerSource (DB-backed reader) ── vct_root(height) ──▶ finalized committer
    │
@@ -55,17 +55,17 @@ finalized committer: verify-before-commit (§6) ──fold roots, skip recompute
 ```text
 peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header-sync driver (zakurad)
    ─▶ ReadRequest::BlockRoots ─▶ the authoritative commitment_roots_by_height index:
-      body-derived rows plus header-authenticated rows ahead of bodies (all-or-nothing; §9)
+      body-derived rows only, and never above the finalized body tip (all-or-nothing; §9)
 ```
 
 **Lifecycle of one fast sync.**
 
 (1) Node starts under `consensus.checkpoint_sync = true` on
 Mainnet → the committer is built in peer mode.
-(2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); the received roots are retained until state authenticates them against the committed header chain, then persisted ahead of the committer (§4.2). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
+(2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); each root is stored as an auxiliary delivery on its header's DAG node and authenticated there as soon as the successor header that proves it arrives, far ahead of the committer (§4.2, §6.0). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
 the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
-(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place; it never writes wrong state. Roots are not individually re-requested, so a hole that no in-flight re-delivery of the same header range fills is a fail-closed stall, surfaced loudly by the §8 metrics.
+(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad or missing root anywhere in the frozen window parks the block in place. The writer publishes a bounded selected-range repair request. A header insertion retries the parked block. A repair that cannot fill the gap remains a fail-closed stall that the §8 metrics report.
 
 **Glossary.**
 
@@ -78,7 +78,7 @@ the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the
 | **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified modern-pool roots into the root indexes but does not advance the full Sapling/Orchard/Ironwood frontiers for every block. Sprout continues to advance locally. If a required modern-pool root is missing, the committer must stop and retry later, because recomputing from a stale modern frontier would write invalid state (§8). |
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5/sub-Nu6_3 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
-| **Header-authenticated roots** | Peer-supplied roots carried in the header-sync `Headers` message, authenticated by state against the canonical header chain, and only then persisted to `commitment_roots_by_height` ahead of body commit (§4.2; [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md)). Verify-before-commit re-checks them at body time (§6). |
+| **Header-authenticated roots** | Peer-supplied roots carried in the header-sync `Headers` message, attached to their header's DAG node as auxiliary deliveries and authenticated against the one-header-later commitment as soon as that header arrives, ahead of body commit (§4.2, §6.0). Verify-before-commit re-checks them at body time (§6). |
 | **All-or-nothing** | A `Headers` message carries roots for _every_ header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |
 | **Kill switch** | `consensus.vct_fast_sync = false`: keep checkpoint sync but force the legacy committer (§4.4). |
 
@@ -165,12 +165,13 @@ Header sync sets `want_tree_aux_roots` on all of its range requests — the fina
 (checkpoint-verified) ranges below the last checkpoint and the non-finalized forward range
 alike. The wire rejects roots a request opted out of, a root count that does not match the
 header count, and per-height misalignment as `MalformedMessage` (§8.1). When a header range
-commits via `CommitHeaderRange`, the reactor retains its root payload in memory; state then
-**authenticates the payload against the canonical header chain and persists the verified
-prefix into the `commitment_roots_by_height` column family ahead of body commit** (§5.3;
-[header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md)). Only roots below
-the last checkpoint are ever _consumed_ by the committer, and only after verify-before-commit
-(§6); authenticated rows for header-ahead heights above the body tip also back serving (§9). The committer then reads them per height through the `PeerSource` seam.
+is inserted via `InsertHeaders`, its roots attach to their header's DAG node as auxiliary
+deliveries; state then **authenticates each delivery against the one-header-later commitment
+that proves it, as soon as that successor header arrives** (§6.0), and records the verdict as
+header-chain evidence. Only roots below the last checkpoint are ever _consumed_ by the
+committer, and only after verify-before-commit (§6). The committer then reads them per height
+through the `PeerSource` seam, and writes the `commitment_roots_by_height` row itself once the
+body commits — the index holds no height the node has not committed.
 The same header commit stores non-zero advertised body-size hints in
 `zakura_header_body_size_by_height`, so block sync can later request realistic ranges even
 before the corresponding bodies are committed. Headers, body-size hints, and roots arrive
@@ -327,9 +328,9 @@ height)`) derives the same payload from a database's per-height trees — the se
 consumer agree is `vct_db_produced_payload_round_trips`.
 
 Because the production `PeerSource` reads straight from the database, peer mode no longer
-exports a root-writer handle. Header sync delivers roots with header ranges, state
-authenticates and persists them through `AuthenticateHeaderRoots`
-on the normal write path, and the committer reads them back through the same database. The
+exports a root-writer handle. Header sync delivers roots with header ranges, state stores and
+authenticates them as header-chain auxiliary deliveries on the normal write path (§6.0), and
+the committer reads the authenticated delivery back for the height it is committing. The
 old per-state `TreeAuxRootsWriter` / `PeerSourceHandle` / targeted-refetch signal are removed.
 The persisted roots store no peer identity; peer accountability for bad roots is the header-sync
 reactor's misbehavior reporting (§8.1), preserving the `zakura-state` / `zakura-network` crate
@@ -352,8 +353,8 @@ places (`crates/zakura-network/src/zakura/header_sync/wire.rs`):
 Body-size hints are scheduling data, not consensus data. `CommitHeaderRange` persists non-zero
 advertised hints for header-ahead heights, preserving the maximum non-zero hint for the same
 header and clearing hints when a competing higher-work header chain replaces the range.
-`ReadRequest::BlockSizeHints` returns the durable committed block size when available, otherwise
-the advertised hint, otherwise `None`. Block sync uses those hints to pack contiguous
+`ReadRequest::MissingBlockBodyMetadata` returns the durable committed block size when available,
+otherwise the advertised hint, otherwise `None`. Block sync uses those hints to pack contiguous
 `GetBlocks` ranges by estimated bytes and to set receive-path size-mismatch tolerance; the
 downloaded body still has to hash to the committed header, and the actual serialized size is
 settled when the body is received.
@@ -394,6 +395,36 @@ is checked against that candidate. A wrong root makes that check fail and the bl
 **rejected, not recomputed** (§8). The standalone `verify_commitment_roots` returns the first
 offending height; over `[start..=end]` it confirms `[start..=end-1]`, and `end+1` confirms
 `end`.
+
+### 6.0 Header-time authentication (the early check)
+
+The committer is the trust boundary. It reaches a height only when it commits that
+height's block body. During fast sync, the header chain runs far ahead of the block bodies. An
+invalid root can therefore remain in the DAG until the committer reaches it.
+
+`service/write/vct_authentication_sweep.rs` detects invalid roots earlier. The sweep walks the
+selected projection above the committed body tip. It maintains a ZIP-221 MMR anchored at that tip.
+At each height `H`, the sweep verifies the selected delivery against the delivery at `H+1`. This
+check uses the same successor boundary as the committer. The sweep calls
+`verify_supplied_roots_from_parts` because it has headers instead of block bodies. The sweep records
+a successful delivery as `Authenticated`. The sweep rejects an attributable delivery. The sweep
+disputes both deliveries when the boundary cannot identify which delivery is invalid. Either
+failure starts metadata repair immediately.
+
+Three properties keep the committer authoritative:
+
+- **The committer still verifies every committed delivery.** The sweep adds an early check.
+  It does not move the trust boundary.
+- **Failure attribution matches the committer.** The header-chain writer disputes both deliveries
+  when the boundary cannot identify the invalid delivery. A replacement can later authenticate the
+  honest delivery and reject the invalid delivery. A failure on a delivery's pre-activation fields
+  rejects only that delivery.
+- **Authentication pins selection.** `select_vct_auxiliary_delivery` prefers an authenticated
+  delivery. Authentication state cannot return to `Unauthenticated`. A later delivery cannot
+  displace roots that the running MMR already folded.
+
+The sweep and committer track repair requests independently. The repair channel publishes the
+lower height. A successful block commit clears only the committer repair request.
 
 ### 6.1 Direct header checks below Heartwood, NU5, and Nu6_3
 
@@ -531,11 +562,19 @@ So the committer **fails closed** rather than falling back to recompute (commit 
   region is exactly `tip < last_checkpoint_height` (the last checkpoint height itself carries the real frontier).
 
 Outside the frozen window (legacy), a missing root is
-simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
-missing root parks the current checkpoint block and retries the same commit **in place** —
-**without resetting the block queue**. The write loop also publishes a bounded repair request
-(`VctRootRepairRequested`) back to header sync, which re-fetches the covered range and runs it
-through the root-authentication lane; the retry is satisfied once a verifiable row is stored.
+simply the ordinary legacy recompute — bit-identical to today. The writer also uses
+this path when a root is present but its required successor metadata is unavailable.
+It still attempts fast commits when complete metadata becomes available later.
+Inside the frozen window, a
+missing root parks the current checkpoint block **in place** — **without resetting the block
+queue**. The writer continues to process header-chain control messages while it remains parked.
+An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
+unrelated block-write messages in their original order. The write loop also publishes a bounded
+repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
+selected prefix through the root-authentication lane. Durable evidence at the blocking height
+keeps the existing one-height repair. An empty gap can use one atomic range up to the selected
+tip, checkpoint handoff, 4,000-header transition limit, aggregate capacity, or first durable row.
+The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
 confirm it against the header
@@ -556,6 +595,9 @@ window is never entered without its roots in hand. Counters:
 `state.vct.root.retry.count` (park-and-retry attempts),
 `state.vct.root.repair.requested` (bounded repair requests published to header sync), and the
 `state.vct.root.stalled.height` gauge (raised once a height is stuck past the warn threshold).
+`state.vct.root.wait.seconds` records the time a block waits for VCT metadata.
+`sync.header.vct.repair.requested.headers` and
+`sync.header.vct.repair.admitted.headers` count range volume.
 
 ### 8.1 Adversarial peer handling
 
@@ -567,11 +609,10 @@ provenance/cooldown/demotion/hedging policy. Bad roots are handled in three laye
   invalid marker byte — is reported through header sync's existing misbehavior path
   (`report_misbehavior(.., MalformedMessage)`), and the range is retried. None of those roots
   reach state.
-- **At header-root authentication**, before any row is persisted, state verifies each
-  peer-supplied payload against the canonical header chain; an invalid payload writes nothing,
-  is attributed to the exact supplying peer, and is re-fetched from another peer
-  ([header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md) §9).
-  This is where a well-formed wrong root is normally caught.
+- **At header-time authentication**, as each successor header arrives and long before the
+  committer reaches the height, state verifies the delivery against the commitment that proves
+  it; an invalid delivery is evicted, attributed to the exact supplying peer, and re-fetched
+  from another peer (§6.0). This is where a well-formed wrong root is normally caught.
 - **At verify-before-commit**, as defense in depth, a stored root that still fails
   authentication against the header commitment (§6) refuses the commit with the retryable
   `VctSuppliedRootUnavailable` error (§8). The row is not deleted (it is below the durable
@@ -591,16 +632,15 @@ dependency on `zakura-network` peer types.
 A node serves roots from local state via `ReadRequest::BlockRoots { start_height, count }` →
 `ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`. The read handler:
 
-- clamps the range to the best **header** tip (which may run ahead of committed bodies);
-- serves the contiguous prefix of the authoritative `commitment_roots_by_height` index —
-  body-derived rows below the body tip and header-authenticated rows above it (so a
-  fast-synced node lacking historical per-height trees can still serve), falling back to
-  `produce_block_roots` over per-height trees only on a pre-index archive database;
+- refuses any range reaching above the finalized body tip;
+- serves the contiguous prefix of the authoritative `commitment_roots_by_height` index — all
+  body-derived (so a fast-synced node lacking historical per-height trees can still serve),
+  falling back to `produce_block_roots` over per-height trees only on a pre-index archive
+  database;
 - returns an empty vec for out-of-range/empty requests.
 
-Every served row is already authenticated or body-derived; there is no provisional tier and a
-forwarding node introduces no additional trust
-([header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md) §14.1).
+Every served row is body-derived, and the serve refuses any range reaching above the finalized
+body tip; there is no provisional tier and a forwarding node introduces no additional trust.
 
 When this read backs a header-sync serve, the header-sync driver attaches roots only when it has
 a **complete aligned set** for the served header range
@@ -675,14 +715,19 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   header-sync `Headers` message as all-or-nothing metadata (§4.2, §5.4) and
   are read back by a DB-backed `PeerSource`. This increment persisted them provisionally at
   header commit; that behavior was replaced by increment 6d.
-- **Increment 6d — header-root authentication (done).** Peer-supplied roots are no longer
-  persisted unauthenticated. The reactor retains root-carrying committed-header payloads in
-  memory, state authenticates each range against the canonical header chain behind a durable
-  ascending frontier (`AuthenticateHeaderRoots`), and only verified prefixes enter
-  `commitment_roots_by_height`; a one-time database format upgrade truncates pre-existing
-  header-ahead rows for re-authentication. Adds the bounded `VctRootRepair` re-delivery path
+- **Increment 6d — header-root authentication (done, superseded by 6e).** Peer-supplied roots are
+  no longer persisted unauthenticated. State authenticated each range against the canonical
+  header chain behind a durable ascending frontier (`AuthenticateHeaderRoots`), and only
+  verified prefixes entered `commitment_roots_by_height`; a one-time database format upgrade
+  truncates pre-existing header-ahead rows. Adds the bounded `VctRootRepair` re-delivery path
   for missing or rejected covered heights. Specified in
   [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md).
+- **Increment 6e — fork-aware header-time authentication (done).** The height-keyed lane assumed
+  one canonical chain, so it could not express a root on a competing fork. Each root now attaches
+  to its header's DAG node as a hash-keyed auxiliary delivery and is authenticated there (§6.0),
+  reusing 6d's verification kernel unchanged. The `AuthenticateHeaderRoots` request, its durable
+  ascending frontier, and the `header_root_auth_frontier` column family are **removed**; the
+  index is written only by committed bodies.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains
   historical RPC without re-adding the frontier recompute to the consensus path.
@@ -750,15 +795,11 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
   exercise serving and committing finalized ranges with roots end-to-end, including the
   all-or-nothing serving helper (roots attached only on complete coverage, otherwise rootless
   headers) and routing received roots into `CommitHeaderRange`.
-- **State persistence:** `CommitHeaderRange` shape-checks roots but persists none;
-  `AuthenticateHeaderRoots` validates canonical hashes and contiguity, persists only the
-  confirmed prefix atomically with the durable frontier, refuses to overwrite the
-  verified row of an already-committed height, replaces a header-supplied
-  root with the body-derived row when its body commits
-  (`write_block_replaces_matching_header_supplied_roots_with_verified_row`), and trims
-  header-supplied roots above a header-store rollback target. The full authentication test
-  plan is in
-  [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md) Appendix A.
+- **State persistence:** `InsertHeaders` validates root shapes and stores the roots as auxiliary
+  deliveries. It does not write a root row. `service/write/vct_authentication_sweep.rs`
+  authenticates each delivery against its successor commitment. The sweep records the result as
+  header-chain evidence. The sweep starts repair after a rejection or dispute. Only a committed
+  body writes a `commitment_roots_by_height` row. Rollback truncates rows above its target height.
 - **Real-data manual runs (`#[ignore]`, env-gated):** `verifies_real_nu5_range_over_synced_forks`
   verifies the real NU5/V2 range against synced archive forks (corrupted root rejected at H+1).
 - **Headline end-to-end (manual, follow-up):** a fresh node fast-syncing
@@ -776,7 +817,8 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 | Verify-before-commit logic | `crates/zakura-state/src/service/finalized_state/commitment_aux_verify.rs` |
 | Embedded frontier plumbing, `select_source_mode`, counters | `crates/zakura-state/src/service/finalized_state/vct.rs` |
 | `checkpoint_sync` mirror field (mode input) | `crates/zakura-state/src/config.rs`; set in `crates/zakurad/src/commands/start.rs` |
-| Embedded Mainnet frontier and provenance | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-frontier.json` |
+| Embedded Mainnet VCT state and manifest | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-subtrees.bin`, `.../mainnet-vct-manifest.json` |
+| Published Mainnet frontier grid, and its packaging | the `zakura-assets` workspace dependency in the root `Cargo.toml`; `crates/zakura-assets/`, `scripts/pack-assets-crate.py` |
 | Commit-path hook, last checkpoint height, frozen-frontier policy | `crates/zakura-state/src/service/finalized_state.rs` |
 | `BlockRoots` serving read (authoritative index) | `crates/zakura-state/src/service.rs` |
 | Root-index lifecycle (`commitment_roots_by_height`, authentication frontier, body-commit/rollback policies) | `crates/zakura-state/src/service/finalized_state/zakura_db/commitment_roots_db.rs`, `.../block.rs`, `.../rollback.rs` |
@@ -788,29 +830,46 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 
 ## 16. Mainnet release-state pipeline
 
-The embedded Mainnet frontier is a release artifact coupled to the terminal Mainnet checkpoint:
-whenever `main-checkpoints.txt`'s max height advances, the matching
-`crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
-synced Zakura state at the new max height, and both must land in the same PR. The offline
-exporter below produces that coupled pair; the publisher, refresh workflow, and release gate
-below consume it.
+The embedded Mainnet frontier, completed-subtree roots, and historical frontier grid are release
+artifacts coupled to the terminal Mainnet checkpoint. Whenever `main-checkpoints.txt`'s max height
+advances, the matching `mainnet-frontier.bin`, `mainnet-subtrees.bin`, and the frontier grid must
+advance to the same height, and all four must land in the same PR. The offline exporter below
+produces the coupled set; the publisher, refresh workflow, and release gate below consume it.
+
+The frontier grid is the one artifact that is not committed. It is published as an exact-pinned
+crates.io package built from `crates/zakura-assets/`, so ~2.1 MB of regenerated bytes stay out of
+the repository's history at the weekly cadence this pipeline runs. What lands in the PR for it is
+a version pin and a lockfile line, held against the manifest by `scripts/check-release-state.sh`
+and by `embedded_mainnet_final_frontiers_parse`. See
+`docs/design/historical-treestate-serving.md` §5.1 for those checks and §5.2 for how a third party
+verifies a published grid.
+
+The grid's coupling is load-bearing rather than tidy: a node refuses to start when the grid's
+checkpoint is below its own fast-sync handoff, and the handoff comes from the embedded checkpoint
+list. See `docs/design/historical-treestate-serving.md` for what the grid is and how a node uses
+it.
 
 ### 16.1 Offline export (`zakura-checkpoints --state-cache-dir`)
 
 The publisher host runs the `zakura-checkpoints` utility (built with
-`--features zakura-checkpoints-offline`) against a quiesced copy of a synced Mainnet state:
+`--features zakura-checkpoints-offline`) against a synced Mainnet **archive** state. The database
+is opened as a read-only RocksDB secondary, so the node does not have to be stopped:
 
 ```text
 zakura-checkpoints \
-  --state-cache-dir /path/to/quiesced-zakura-cache \
+  --state-cache-dir /path/to/archive-zakura-cache \
   --full-list \
-  --mainnet-frontier-output /out/mainnet-frontier.bin > /out/main-checkpoints.txt
+  --mainnet-frontier-output /out/mainnet-frontier.bin \
+  --mainnet-subtree-output /out/mainnet-treestate-subtrees.bin \
+  --mainnet-frontier-grid-output /out/mainnet-frontier-grid.bin \
+  > /out/main-checkpoints.txt
 ```
 
 - Offline mode reads canonical hashes and `BlockInfo` sizes straight from the finalized
-  database (read-only), so it works on pruned state and needs no RPC or running node. The
-  quiesced database tip is by construction `MAX_BLOCK_REORG_HEIGHT` (1000) blocks behind the
-  network tip, which keeps every emitted checkpoint reorg-safe.
+  database (read-only), so it needs no RPC. Checkpoints, the frontier, and the subtree roots
+  come out of pruned state too; the frontier grid does not, which is why the supported
+  generator is an archive node. The database tip is by construction `MAX_BLOCK_REORG_HEIGHT`
+  (1000) blocks behind the network tip, which keeps every emitted checkpoint reorg-safe.
 - New checkpoints continue the same cumulative byte-count / 400-block height-gap selection as
   the RPC mode, starting from the embedded Mainnet max checkpoint. Selection state fully
   resets at every selected checkpoint, so exports taken at different tips are byte-for-byte
@@ -830,31 +889,60 @@ zakura-checkpoints \
 - Frontier correctness inherits the finalized database's trust boundary: the exporter reads
   trees produced by Zakura's validated, atomic finalized-state commits rather than replaying
   historical transaction bodies. The parser validates framing and height, not the tree roots'
-  provenance. This deliberate trust model keeps the exporter compatible with pruned databases;
-  operators must only export from a quiesced state produced by a trusted Zakura node.
+  provenance. This keeps final-frontier generation itself compatible with pruned databases, but
+  does not remove the coupled frontier grid's archive-body requirement. Operators must only
+  export from a quiesced state produced by a trusted Zakura node.
+- The subtree artifact starts with the reviewed roots already embedded in the binary, then appends
+  subtree rows the database retained after that checkpoint. Any overlapping database row must
+  match the embedded record. The new frontier supplies the exact number of roots needed, and the
+  complete result is proven against it before either artifact is returned. This one path works for
+  legacy and VCT databases and does not need old block bodies or skipped per-height frontiers.
+- The frontier grid covers every height below the same last emitted checkpoint. Entries come
+  from stored per-height trees wherever the database has them and from a replay of retained
+  block bodies only across a fast-synced database's absent band, and each one is root-checked
+  before it is published. The walk starts at genesis regardless of the generating database's
+  own boundaries, so exports from different databases and different tips are byte-prefix
+  extensions of one another — the same grid contract the checkpoint list follows, which is
+  what lets the importer verify grid updates as pure appends.
+- `--mainnet-frontier-grid-input` resumes the grid from the previously published one, so a
+  routine export scans only the blocks above its last entry instead of the whole chain. Carried
+  entries are re-checked against the database and then written verbatim, which makes each bundle
+  a prefix-extension of its predecessor by construction — the property the importer checks.
+- All artifacts are written before any checkpoint line reaches stdout, so a failure never
+  leaves a caller's redirected output holding an advanced list without its coupled state.
+- `--mainnet-frontier-grid-checkpoint <height>` backfills the grid alone, for a checkpoint the
+  binary already embeds. It emits no checkpoints and refuses the other artifact outputs, so a
+  release state that predates the grid can gain one without advancing the checkpoint list as a
+  side effect. The height must be an embedded checkpoint, and the database's hash at it must
+  match the embedded list.
 - Checkpoint lines go to stdout; all status goes to stderr. RPC mode remains for Testnet
   updates and diagnostics.
 
 ### 16.2 Bundle, pointer, and refresh workflow
 
-The publisher (`deploy/release-state/`) uploads each export to R2 as an immutable bundle
-`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin}` — where
-`meta.json` binds the network, terminal height/hash, an RFC 3339 generation time, and each
-file's size and SHA-256 — then atomically replaces the mutable `release-state/latest.json`
-pointer (height, hash, `meta_url`, `meta_sha256`), keeping the newest few bundles.
+The publisher (`deploy/release-state/`) uploads each export to R2 as an immutable bundle containing
+`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`,
+`mainnet-treestate-subtrees.bin`, and `mainnet-frontier-grid.bin`. `meta.json` binds the network,
+terminal height/hash, an RFC 3339 generation time, and each data file's size and SHA-256. The
+publisher then atomically replaces the mutable `release-state/latest.json` pointer (height, hash,
+`meta_url`, `meta_sha256`), keeping the newest few bundles.
 
 The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
 `prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
 redirects, bounded reads, digest verification at every hop, and a maximum bundle age. They
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
-byte-identical prefix of the bundle's list, replaces the checkpoint file and frontier, and
-writes `vct/mainnet-frontier.json` provenance (source `release-state-bundle`, heights,
-digests, bundle binding).
+byte-identical prefix of the bundle's list, requires each pool's subtree bytes to retain the
+committed prefix, requires the grid's entry payload to retain the committed prefix and to
+cover the bundle's own checkpoint, replaces all four artifacts, and writes
+`vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights, digests,
+entry count, bundle binding).
 
 The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
-— including `cargo test -p zakura-state --lib -- frontier` — restricts the diff to exactly
-those four files, and opens a signed **draft PR** for human review. During release
+— including proving the candidate subtree roots against its frontier — restricts the diff to
+exactly those six files, and opens a signed **draft PR** for human review. The grid is the one
+committed artifact large enough to matter to `history-growth.yml`, which raises its packed-growth
+allowance only for a change that touches nothing outside the release-state files. During release
 preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the
 sole owner of its projected value and summary. The release workflow re-proves the imported
 checkpoint/frontier pairing and includes the import in its draft release PR. Checkpoints are
@@ -863,7 +951,10 @@ digests only prove faithful transport from our own publisher.
 
 ### 16.3 Committed provenance and the release gate
 
-`vct/mainnet-frontier.json` is committed next to the frontier. The
+`vct/mainnet-vct-manifest.json` is committed next to the frontier, subtree, and frontier grid
+artifacts. Its `frontier_grid_*` fields are optional: a manifest written before the grid joined
+the bundle is still valid, and `scripts/check-release-state.sh` then requires that no grid file
+is committed either, so the record and the file can never disagree. The
 `embedded_mainnet_final_frontiers_parse` unit test re-derives its digests from the embedded
 checkpoint list and frontier bytes on every PR, so a desynced checkpoint/frontier/provenance
 combination fails ordinary CI. The current frontier predates the pipeline and is recorded
@@ -887,6 +978,7 @@ are:
 
 ```text
 cargo test -p zakura-state --lib -- frontier sprout_change
+cargo test -p zakura-state --lib treestate_export
 cargo test -p zakura-utils --features zakura-checkpoints-offline
 ```
 

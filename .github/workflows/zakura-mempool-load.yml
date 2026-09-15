@@ -150,6 +150,8 @@ jobs:
         id: droplet
         uses: ./.github/actions/do-droplet
         with:
+          policy: fixed
+          regions: nyc1
           name: zakura-mempool-${{ steps.target.outputs.slug }}-${{ github.run_id }}
           size: ${{ inputs.droplet_size || 'c-8' }}
           ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
@@ -306,7 +308,7 @@ jobs:
 
       - name: Upload artifacts
         if: always() && steps.droplet.outputs.ip != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakura-mempool-load-${{ github.run_id }}
           path: /tmp/out/

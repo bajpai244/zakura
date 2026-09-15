@@ -16,6 +16,9 @@ use zakura_chain::{
     transparent,
 };
 
+#[cfg(feature = "indexer")]
+use zakura_chain::serialization::ZcashSerialize;
+
 use crate::{
     config::StorageMode,
     constants::{MAX_BLOCK_REORG_HEIGHT, MAX_PRUNE_HEIGHTS_PER_COMMIT, MIN_PRUNING_RETENTION},
@@ -333,6 +336,8 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
     let max_checkpoint_height = Height(tx_retention + checkpoint_lowest_retained.0 - 1);
     let mut state =
         new_unvalidated_state_with_checkpoint_retention(&config, &network, max_checkpoint_height);
+    let mut retained_height = state.db.subscribe_retained_block_height();
+    assert_eq!(*retained_height.borrow_and_update(), Height::MIN);
     let blocks = network.blockchain_map();
 
     for height in 0..=max_checkpoint_height.0 {
@@ -343,7 +348,23 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, "checkpoint handoff tests")
+            .commit_finalized_direct_with(
+                block.into(),
+                None,
+                None,
+                "checkpoint handoff tests",
+                |db, batch, _proof| {
+                    db.header_chain_disk_db()
+                        .write(batch)
+                        .expect("checkpoint batch writes");
+                    assert_eq!(
+                        *retained_height.borrow(),
+                        db.lowest_retained_height().unwrap_or(Height::MIN),
+                        "the floor must be visible before this callback can publish the new tip"
+                    );
+                    Ok(())
+                },
+            )
             .expect("test block is valid");
     }
 
@@ -351,6 +372,14 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
         "checkpoint skipping advances the marker to the retention start"
+    );
+
+    assert!(retained_height
+        .has_changed()
+        .expect("state owns the publisher"));
+    assert_eq!(
+        *retained_height.borrow_and_update(),
+        checkpoint_lowest_retained
     );
 
     for height in 1..checkpoint_lowest_retained.0 {
@@ -388,6 +417,10 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         Some(online_prune_until),
         "online pruning resumes exactly at the checkpoint retention start"
     );
+    assert!(retained_height
+        .has_changed()
+        .expect("state owns the publisher"));
+    assert_eq!(*retained_height.borrow_and_update(), online_prune_until);
     assert!(
         state
             .db
@@ -611,6 +644,15 @@ fn chain_identity_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
     assert_eq!(state.db.hash(tip_height), Some(tip_hash));
     assert_eq!(state.db.height(tip_hash), Some(tip_height));
 
+    let initial_tip = crate::service::finalized_chain_tip(&state.db)
+        .expect("a bodyless pruned finalized tip still initializes chain sync");
+    assert_eq!(
+        (initial_tip.height, initial_tip.hash),
+        (tip_height, tip_hash)
+    );
+    assert!(initial_tip.transactions.is_empty());
+    assert!(initial_tip.transaction_hashes.is_empty());
+
     let no_chain = Option::<Arc<Chain>>::None;
     assert_eq!(
         hash_by_height(no_chain.clone(), &state.db, tip_height),
@@ -689,6 +731,8 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         &network,
         max_checkpoint_height,
     );
+    let mut retained_height = pruned_state.db.subscribe_retained_block_height();
+    assert_eq!(*retained_height.borrow_and_update(), Height::MIN);
 
     let block: Arc<Block> = blocks
         .get(&TEST_BLOCKS)
@@ -704,6 +748,13 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         pruned_state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
         "archive backlog is pruned up to the checkpoint retention start"
+    );
+    assert!(retained_height
+        .has_changed()
+        .expect("state owns the publisher"));
+    assert_eq!(
+        *retained_height.borrow_and_update(),
+        checkpoint_lowest_retained
     );
 
     for height in 1..checkpoint_lowest_retained.0 {
@@ -842,6 +893,10 @@ fn archive_mode_keeps_checkpoint_raw_transactions_before_checkpoint_retention_st
         None,
         "archive mode does not write a pruning marker"
     );
+    assert_eq!(
+        *state.db.subscribe_retained_block_height().borrow(),
+        Height::MIN
+    );
 }
 
 #[test]
@@ -964,6 +1019,20 @@ fn initial_online_prune_preserves_pre_boundary_history() {
             .is_some(),
         "preserved block and size below the pruning marker is still available"
     );
+    #[cfg(feature = "indexer")]
+    assert_eq!(
+        state
+            .db
+            .raw_block_bytes(Height(prune_from - 1).into())
+            .expect("preserved raw block below the pruning marker is still assembled"),
+        state
+            .db
+            .block(Height(prune_from - 1).into())
+            .expect("preserved block below the pruning marker is still reconstructed")
+            .zcash_serialize_to_vec()
+            .expect("serialization works for a previously committed block"),
+        "assembled raw block bytes match the block's consensus serialization"
+    );
     assert!(
         state.db.transaction(pruned_tx_hash).is_none(),
         "raw transaction at the online pruning boundary is pruned"
@@ -975,6 +1044,14 @@ fn initial_online_prune_preserves_pre_boundary_history() {
     assert!(
         state.db.block_and_size(Height(prune_from).into()).is_none(),
         "pruned block and size at the online pruning boundary is unavailable"
+    );
+    #[cfg(feature = "indexer")]
+    assert!(
+        state
+            .db
+            .raw_block_bytes(Height(prune_from).into())
+            .is_none(),
+        "pruned raw block at the online pruning boundary is unavailable"
     );
     assert_eq!(
         state.db.lowest_retained_height(),
@@ -1055,7 +1132,7 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
             .is_some(),
         "genesis transaction retained"
     );
-    for height in 4..=TEST_BLOCKS {
+    for height in std::iter::once(0).chain(4..=TEST_BLOCKS) {
         let block = state
             .db
             .block(Height(height).into())
@@ -1168,6 +1245,10 @@ fn reopened_pruned_database_reports_pruned_before_committing_a_block() {
     // without waiting for a block commit to prune anything.
     let reopened = FinalizedState::new(&config, &network).expect("reopening the database succeeds");
 
+    assert_eq!(
+        *reopened.db.subscribe_retained_block_height().borrow(),
+        Height(4)
+    );
     assert!(reopened.db.is_pruned());
     assert!(reopened.db.prunes_historical_data());
     assert_eq!(
@@ -1175,6 +1256,37 @@ fn reopened_pruned_database_reports_pruned_before_committing_a_block() {
         Some(Height(4)),
         "the prune height tracks the marker once bodies have been deleted"
     );
+}
+
+#[test]
+fn secondary_retention_watch_follows_its_database_view() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        ..pruned_config()
+    };
+    let primary = new_state_with_blocks(&config, &network);
+    let (read_state, secondary, _non_finalized) =
+        crate::init_read_only(config, &network).expect("secondary opens alongside the primary");
+    let mut retained_height = read_state.subscribe_retained_block_height();
+    assert_eq!(*retained_height.borrow_and_update(), Height::MIN);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&primary.db, Height(1), Height(4));
+    primary.db.write_batch(batch).expect("prune batch writes");
+    assert_eq!(*retained_height.borrow(), Height::MIN);
+
+    secondary
+        .try_catch_up_with_primary()
+        .expect("secondary catches up with the prune");
+    assert_eq!(secondary.lowest_retained_height(), Some(Height(4)));
+    assert!(retained_height
+        .has_changed()
+        .expect("secondary owns the publisher"));
+    assert_eq!(*retained_height.borrow_and_update(), Height(4));
 }
 
 #[test]
@@ -1372,6 +1484,75 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
 }
 
 #[test]
+#[should_panic(expected = "network.p2p_stack")]
+fn reopening_interrupted_fast_sync_on_legacy_stack_refuses_to_park() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: true,
+        vct_fast_sync: true,
+        enable_zakura_header_seed_from_committed_blocks: false,
+        ..Config::default()
+    };
+    {
+        let state = new_state_with_blocks(&config, &Mainnet);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+    {
+        let v2_config = Config {
+            enable_zakura_header_seed_from_committed_blocks: true,
+            ..config.clone()
+        };
+        let state = FinalizedState::new(&v2_config, &Mainnet)
+            .expect("the v2 stack can resume the interrupted VCT sync");
+        assert_eq!(state.db.vct_synced_below(), Some(Height(100)));
+        let reader = FinalizedState::new_with_debug(&config, &Mainnet, true, true)
+            .expect("a read-only state does not resume VCT writes");
+        assert_eq!(reader.db.vct_synced_below(), Some(Height(100)));
+    }
+    let _state = FinalizedState::new(&config, &Mainnet);
+}
+
+#[test]
+fn read_only_interrupted_fast_sync_accepts_disabled_sync_settings() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: true,
+        vct_fast_sync: true,
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::default()
+    };
+    {
+        let state = new_state_with_blocks(&config, &Mainnet);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+    for checkpoint_sync in [false, true] {
+        for vct_fast_sync in [false, true] {
+            for enable_zakura_header_seed_from_committed_blocks in [false, true] {
+                let reader_config = Config {
+                    checkpoint_sync,
+                    vct_fast_sync,
+                    enable_zakura_header_seed_from_committed_blocks,
+                    ..config.clone()
+                };
+                let reader = FinalizedState::new_with_debug(&reader_config, &Mainnet, true, true)
+                    .expect("readers do not need a VCT repair source");
+                assert_eq!(reader.db.vct_synced_below(), Some(Height(100)));
+            }
+        }
+    }
+}
+
+#[test]
 fn validate_storage_mode_enforces_retention_floor() {
     let pruned = |tx_retention| Config {
         storage_mode: StorageMode::Pruned(PruningConfig { tx_retention }),
@@ -1405,5 +1586,104 @@ fn validate_storage_mode_enforces_retention_floor() {
             .validate_storage_mode(&regtest)
             .is_ok(),
         "Regtest accepts a retention below the Mainnet floor"
+    );
+}
+
+/// The raw range read through the read state service stops before a pruned
+/// body and must not skip over the gap, even though every later height up to
+/// the tip retains its body.
+///
+/// This pins the stop-before-first-missing contract of
+/// `ReadRequest::RawBlocksByHeightRange`: a response that resumed after the
+/// gap would look complete to a caller that only checks the returned count.
+#[cfg(feature = "indexer")]
+#[tokio::test]
+async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
+    use tower::ServiceExt;
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
+
+    use crate::{
+        service::{
+            non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
+            HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
+        },
+        ReadRequest, ReadResponse,
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+    let (prune_from, prune_until) =
+        prune_height_range_inner(TEST_BLOCKS, 5, None).expect("initial prune range exists");
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&state.db, Height(prune_from), Height(prune_until));
+    state.db.write_batch(batch).expect("prune batch writes");
+
+    // The pruned height is a one-height gap: bodies are retained both below
+    // and above it.
+    assert!(
+        state
+            .db
+            .raw_block_bytes(Height(prune_until).into())
+            .is_some(),
+        "the body above the pruned height is retained"
+    );
+
+    let (_non_finalized_state_sender, non_finalized_state_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(&network));
+    let (_vct_root_repair_sender, vct_root_repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
+
+    let read_state = ReadStateService::new(
+        &state,
+        None,
+        Arc::new(std::sync::OnceLock::new()),
+        WatchReceiver::new(non_finalized_state_receiver),
+        vct_root_repair_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            views: header_chain_view_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
+        crate::service::load_historical_frontier_artifact(
+            &state.network(),
+            state.db.config(),
+            state.db.vct_synced_below().is_some(),
+        )
+        .expect("the default historical frontier configuration loads")
+        .discard_if_before_vct_handoff(state.db.config(), &state.db),
+    );
+
+    let response = read_state
+        .oneshot(ReadRequest::RawBlocksByHeightRange {
+            start: Height(0),
+            count: TEST_BLOCKS + 1,
+        })
+        .await
+        .expect("raw range read succeeds");
+    let ReadResponse::RawBlocks(blocks) = response else {
+        panic!("unexpected response type for RawBlocksByHeightRange");
+    };
+
+    let heights: Vec<u32> = blocks.iter().map(|(height, _)| height.0).collect();
+    assert_eq!(
+        heights,
+        (0..prune_from).collect::<Vec<_>>(),
+        "the response stops before the pruned body and must not resume above the gap"
     );
 }

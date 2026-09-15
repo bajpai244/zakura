@@ -2,7 +2,6 @@
 
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
-use static_assertions::const_assert;
 use zakura_chain::{
     block::Height,
     parameters::{
@@ -18,9 +17,8 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
-        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
 };
@@ -80,10 +78,12 @@ fn ensure_peer_connection_limits_consistent() {
 
     // Zakura accepts more inbound connections than it opens outbound connections,
     // so peers which can not accept inbound connections can still reach these nodes.
-    const_assert!(
-        INBOUND_PEER_LIMIT_MULTIPLIER * OUTBOUND_PEER_LIMIT_DIVISOR
-            >= OUTBOUND_PEER_LIMIT_MULTIPLIER
-    );
+    const {
+        assert!(
+            INBOUND_PEER_LIMIT_MULTIPLIER * OUTBOUND_PEER_LIMIT_DIVISOR
+                >= OUTBOUND_PEER_LIMIT_MULTIPLIER
+        );
+    }
 
     let config = Config::default();
 
@@ -509,6 +509,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         config.zakura.bootstrap_peers,
         default_testnet_zakura_bootstrap_peers()
     );
+    assert!(!config.zakura.nat_traversal);
     assert!(config.zakura.max_connections > 0);
     assert_eq!(
         config.zakura.max_connections_per_ip,
@@ -518,10 +519,6 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
     assert_eq!(
         config.zakura.header_sync.max_headers_per_response,
         DEFAULT_HS_RANGE
-    );
-    assert_eq!(
-        config.zakura.header_sync.max_inflight_requests,
-        DEFAULT_HS_MAX_INFLIGHT
     );
     assert_eq!(
         config.zakura.header_sync.status_refresh_interval,
@@ -589,6 +586,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+        nat_traversal = true
         max_connections = 7
         max_connections_per_ip = 5
         max_pending_handshakes = 3
@@ -598,7 +596,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.header_sync]
         max_headers_per_response = 333
-        max_inflight_requests = 9
         status_refresh_interval = "45s"
 
         [zakura.block_sync]
@@ -613,12 +610,13 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
+    assert!(config.zakura.nat_traversal);
+    assert!(serialized.contains("nat_traversal = true"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
     assert!(serialized.contains("[zakura.header_sync]"));
     assert!(serialized.contains("max_headers_per_response = 333"));
-    assert!(serialized.contains("max_inflight_requests = 9"));
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));
@@ -789,14 +787,38 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     );
 }
 
+#[test]
+fn max_block_time_start_height_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+    let start_height = Height(42);
+    let mut config = Config {
+        network: testnet::Parameters::build()
+            .with_max_block_time_start_height(start_height)
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::for_test(P2pStack::Dual)
+    };
+    config.zakura.apply_network_defaults(&config.network);
+
+    let serialized = toml::to_string(&config).expect("the custom network serializes");
+    let deserialized: Config =
+        toml::from_str(&serialized).expect("the custom network deserializes");
+    assert_eq!(config, deserialized);
+    assert!(!deserialized.network.is_max_block_time_enforced(Height(41)));
+    assert!(deserialized
+        .network
+        .is_max_block_time_enforced(start_height));
+}
+
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
-/// every later startup, so the node's `NodeId` is stable across restarts.
+/// every later startup, so the node's `EndpointId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
 /// every call and never wrote the reserved identity key file, so two startups
-/// produced different `NodeId`s and no key file existed.
+/// produced different `EndpointId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zakura_test::init();
@@ -832,7 +854,7 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     }
 
     // Second startup reading the same key file (simulating a process restart)
-    // must reuse the persisted key, yielding the same `NodeId`.
+    // must reuse the persisted key, yielding the same `EndpointId`.
     let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(

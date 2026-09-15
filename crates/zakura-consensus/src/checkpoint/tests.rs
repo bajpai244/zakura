@@ -7,7 +7,7 @@ use std::{cmp::min, time::Duration};
 use color_eyre::eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
@@ -1022,6 +1022,331 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
         FinishedVerifying
     );
 
+    Ok(())
+}
+
+/// A side-chain rejection must preserve verified progress while state commits lag behind.
+#[tokio::test]
+async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|bytes| Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes"))
+        .collect();
+    let checkpoints: BTreeMap<_, _> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| {
+            (
+                blocks[index].coinbase_height().unwrap(),
+                blocks[index].hash(),
+            )
+        })
+        .collect();
+    let initial_tip = (block::Height(3), blocks[3].hash());
+    let (release_commits, gate) = tokio::sync::watch::channel(false);
+    let state = tower::service_fn(move |request: zs::Request| {
+        let mut gate = gate.clone();
+        async move {
+            match request {
+                zs::Request::Tip => Ok(zs::Response::Tip(Some(initial_tip))),
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    gate.wait_for(|released| *released)
+                        .await
+                        .expect("the test retains the commit gate");
+                    Ok::<_, BoxError>(zs::Response::Committed(block.hash))
+                }
+                _ => unreachable!("the verifier only requests commits and the tip"),
+            }
+        }
+    });
+    let mut verifier =
+        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
+            .map_err(|error| eyre!(error))?;
+
+    let side_chain = verifier.call(blocks[4].clone());
+    // Model a competing block after basic validation without mining another valid PoW.
+    let side_hash = block::Hash([0xAA; 32]);
+    verifier.queued.get_mut(&block::Height(4)).unwrap()[0].block =
+        CheckpointVerifiedBlock::new(blocks[4].clone(), Some(side_hash), None);
+    let mut commits = FuturesUnordered::new();
+    for block in &blocks[4..=6] {
+        commits.push(verifier.call(block.clone()));
+    }
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6))
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), side_chain).await.unwrap(),
+        Err(VerifyCheckpointError::UnexpectedSideChain { found, .. }) if found == side_hash
+    ));
+
+    // This call applies any reset while the state tip remains at height 3.
+    commits.push(verifier.call(blocks[7].clone()));
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "a side-chain rejection must not reopen the consumed checkpoint range"
+    );
+    assert_eq!(verifier.reset_generation, 0);
+    for block in &blocks[8..=10] {
+        commits.push(verifier.call(block.clone()));
+    }
+    release_commits.send_replace(true);
+    timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
+        while let Some(result) = commits.next().await {
+            result.expect("both checkpoint ranges must commit");
+        }
+    })
+    .await
+    .expect("checkpoint commits must finish");
+    assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
+    Ok(())
+}
+
+/// A late reset from an earlier commit generation must not rewind recovered progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_commit_reset_must_not_rewind_recovered_checkpoint_progress() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let blockchain: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .iter()
+        .map(|(height, bytes)| {
+            let block = Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes");
+            let hash = block.hash();
+            let coinbase_height = block.coinbase_height().expect("block has a height");
+            assert_eq!(*height, coinbase_height.0);
+            (coinbase_height, hash)
+        })
+        .collect();
+    assert!(blockchain.len() > 10);
+
+    let checkpoint_list: BTreeMap<_, _> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| blockchain[index])
+        .collect();
+    let state_service = zakura_state::init_test(&Mainnet).await;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        Some(blockchain[3]),
+        state_service,
+    )
+    .map_err(|e| eyre!(e))?;
+
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(blockchain[3]),
+        })
+        .expect("the verifier owns the reset receiver");
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(blockchain[6]),
+        })
+        .expect("the verifier owns the reset receiver");
+    checkpoint_verifier.apply_pending_reset();
+
+    assert_eq!(checkpoint_verifier.reset_generation, 1);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        InitialTip(block::Height(6)),
+        "one reset generation must use its highest durable tip"
+    );
+
+    checkpoint_verifier.verifier_progress = PreviousCheckpoint(block::Height(6));
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(blockchain[3]),
+        })
+        .expect("the verifier owns the reset receiver");
+    checkpoint_verifier.apply_pending_reset();
+
+    assert_eq!(checkpoint_verifier.reset_generation, 1);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "a late reset from the failed generation must not reopen a committed gap"
+    );
+
+    Ok(())
+}
+
+/// Blocks queued before a reset must use the generation that verifies their range.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let blockchain: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .iter()
+        .map(|(height, bytes)| {
+            let block = Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes");
+            let hash = block.hash();
+            let coinbase_height = block.coinbase_height().expect("block has a height");
+            assert_eq!(*height, coinbase_height.0);
+            (block, coinbase_height, hash)
+        })
+        .collect();
+    assert!(blockchain.len() > 10);
+
+    let checkpoint_list: BTreeMap<_, _> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| {
+            let (_block, height, hash) = &blockchain[index];
+            (*height, *hash)
+        })
+        .collect();
+    let initial_tip = (blockchain[3].1, blockchain[3].2);
+    let (tip_sender, _tip_receiver) = tokio::sync::watch::channel(Some(initial_tip));
+    let state_service = tower::service_fn(move |request: zs::Request| {
+        let tip_sender = tip_sender.clone();
+
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    if block.height == block::Height(4) {
+                        tip_sender.send_replace(Some((block.height, block.hash)));
+                        Ok(zs::Response::Committed(block.hash))
+                    } else {
+                        let mut tip_receiver = tip_sender.subscribe();
+                        loop {
+                            let height_four_is_committed = tip_receiver
+                                .borrow()
+                                .is_some_and(|(height, _hash)| height >= block::Height(4));
+                            if height_four_is_committed {
+                                break;
+                            }
+                            tip_receiver
+                                .changed()
+                                .await
+                                .expect("the test retains the tip sender");
+                        }
+
+                        Err::<zs::Response, BoxError>(
+                            std::io::Error::other("injected checkpoint commit failure").into(),
+                        )
+                    }
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(*tip_sender.borrow())),
+                _ => unreachable!("checkpoint verifier test uses only commit and tip requests"),
+            }
+        }
+    });
+    let mut checkpoint_verifier =
+        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, Some(initial_tip), state_service)
+            .map_err(|error| eyre!(error))?;
+
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let height_5 = ready.call(blockchain[5].0.clone());
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let height_6 = ready.call(blockchain[6].0.clone());
+
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(initial_tip),
+        })
+        .expect("the verifier owns the reset receiver");
+
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let height_4 = ready.call(blockchain[4].0.clone());
+    assert_eq!(checkpoint_verifier.reset_generation, 1);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "the recovered range must verify before its commits finish"
+    );
+
+    height_4.await.expect("height 4 must commit");
+    height_5
+        .await
+        .expect_err("the test state must reject height 5");
+    height_6
+        .await
+        .expect_err("the test state must reject height 6");
+
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let retry_height_5 = ready.call(blockchain[5].0.clone());
+
+    assert_eq!(checkpoint_verifier.reset_generation, 2);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        InitialTip(block::Height(4)),
+        "a failed recovered commit must reset optimistic verifier progress"
+    );
+    assert!(
+        retry_height_5.now_or_never().is_none(),
+        "the verifier must queue the retry instead of returning AlreadyVerified"
+    );
+
+    Ok(())
+}
+
+/// A canceled caller must not discard recovery after a failed state commit.
+#[tokio::test]
+async fn dropped_response_must_preserve_failed_commit_reset() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let genesis =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let block = Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])?;
+    let initial_tip = (block::Height(0), genesis.hash());
+    let checkpoints = BTreeMap::from([initial_tip, (block::Height(1), block.hash())]);
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let state = tower::service_fn(move |request: zs::Request| {
+        let mut gate = gate.clone();
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(_) => {
+                    gate.wait_for(|released| *released)
+                        .await
+                        .expect("the test retains the sender");
+                    Err::<zs::Response, BoxError>(
+                        std::io::Error::other("injected commit failure").into(),
+                    )
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(Some(initial_tip))),
+                _ => unreachable!("the verifier only commits blocks and reads the tip"),
+            }
+        }
+    });
+    let mut verifier =
+        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
+            .map_err(|error| eyre!(error))?;
+    let response = verifier.call(block);
+    assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
+    drop(response);
+    release.send_replace(true);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while verifier.reset_generation == 0 {
+            verifier.apply_pending_reset();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed commit must request recovery even after its caller drops the response");
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        InitialTip(block::Height(0))
+    );
     Ok(())
 }
 

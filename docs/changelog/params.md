@@ -1,20 +1,24 @@
 # Changelog: Parameters
 
-A focused ledger of deliberate changes to **tunable parameters** in this fork —
+A focused ledger of deliberate changes to **node tunable parameters** in this fork —
 constants, config defaults, timeouts, window/limit sizes, and congestion-control
 coefficients.
 
 This complements the root `CHANGELOG.md`. The changelog records user-visible behavior in
-prose; this file is a compact table of every parameter value we have re-tuned, so
+prose; this file is a compact table of node parameter values we have re-tuned, so
 reviewers and operators can see — at a glance — what changed, where it lives, and
 why.
 
 ## How to use this file
 
-When a PR changes a tunable parameter, add a row to the table below **in the same
-PR**. A "tunable parameter" is any value chosen for behavior or performance rather
+When a PR changes a node tunable parameter, add a row to the table below **in the same
+PR**. A "tunable parameter" is any value chosen for node behavior or performance rather
 than correctness — a constant, a `Config` default, a timeout, a window or limit,
 or a backoff/growth coefficient.
+
+Infrastructure, CI, deployment, and notification settings are outside this
+ledger's scope. Document those changes in the relevant infrastructure or operator
+documentation instead.
 
 Keep entries **newest-first**. Each row records:
 
@@ -28,6 +32,36 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `status_unavailable_seconds` | `deploy/continuous-sync/continuous-sync.py` and `deploy/continuous-sync/nodes.toml` | new → `600 s` | [#846](https://github.com/zakura-core/zakura/pull/846) | Stop a canary after ten continuous minutes without exact sync evidence while allowing individual metrics errors and timeouts to recover. |
+| `network.zakura.nat_traversal` | `crates/zakura-network/src/zakura/handler.rs` | always disabled → configurable, default `false`; `true` allows up to 32 remote candidate addresses with the pinned Iroh defaults | [#968](https://github.com/zakura-core/zakura/pull/968) | Let operators opt in to QUIC candidate exchange and probes while preserving the default behavior. |
+| `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |
+| `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
+| `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
+| `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |
+| `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |
+| `MAX_CANDIDATE_TIPS_V1` | `crates/zakura-header-chain/src/config.rs` | `10` → `11` | [#831](https://github.com/zakura-core/zakura/pull/831) | Retain ten full-state fork tips plus one independent selected header tip, so header candidate pressure cannot evict a branch that full state still owns. |
+| `VCT_LOCAL_OPERATION_FATAL_AFTER` | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | new → `30 min` | [#821](https://github.com/zakura-core/zakura/pull/821) | Terminate a node whose local VCT repair prepare or apply operation remains pending, while allowing slow valid operations substantially more time than the existing one-minute stall diagnostic. |
+| `COST_PER_BLOCK_US` | `crates/zakura-state/.../treestate_export.rs` | `1_500` → `249` | [#768](https://github.com/zakura-core/zakura/pull/768) | Quiet-region median from cold 500-block windows on a Mainnet legacy archive (2026-08-21); the previous constant overestimated fixed per-block overhead and over-densified the published frontier grid. |
+| `COST_PER_COMMITMENT_US` | `crates/zakura-state/.../treestate_export.rs` | `47` → `30` | [#768](https://github.com/zakura-core/zakura/pull/768) | Joint OLS fit with `COST_PER_BLOCK_US` against the same window samples; regenerates the embedded Mainnet grid to ≈2.07 MB / 2281 entries at checkpoint 3453771 while keeping the 2 s per-entry budget. |
+| `MINED_BLOCK_EVENT_SEND_TIMEOUT` | `crates/zakura-rpc/src/methods.rs` | new → `5 s` | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached final gossip sends when the mined-block event channel stalls. |
+| `MAX_BACKGROUND_TEMPLATE_PREPARATIONS` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | new → `1` task | [#748](https://github.com/zakura-core/zakura/pull/748) | Prevent repeated template requests from delaying solved block submissions with concurrent preparation work. |
+| `ENTRY_TTL` | `crates/zakura-consensus/src/block/prepared.rs` | new → `10 min` | [#748](https://github.com/zakura-core/zakura/pull/748) | Expire prepared candidates after miners should have replaced their work. |
+| `SERVER_MAX_BYTES` | `crates/zakura-consensus/src/block/prepared.rs` | new → `48 MiB` | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound server-template candidate memory within the existing 64 MiB total. |
+| `SERVER_MAX_ENTRIES` | `crates/zakura-consensus/src/block/prepared.rs` | new → `24` candidates | [#748](https://github.com/zakura-core/zakura/pull/748) | Keep client proposals from evicting server-template candidates. |
+| `PROPOSAL_MAX_BYTES` | `crates/zakura-consensus/src/block/prepared.rs` | new → `16 MiB` | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound client-proposal candidate memory within the existing 64 MiB total. |
+| `PROPOSAL_MAX_ENTRIES` | `crates/zakura-consensus/src/block/prepared.rs` | new → `8` candidates | [#748](https://github.com/zakura-core/zakura/pull/748) | Keep client proposals in an independent candidate partition. |
+| `MAX_PENDING_BLOCK_WAITS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | new → `32` waits | [#748](https://github.com/zakura-core/zakura/pull/748) | Reserve inbound capacity when peers request early-advertised blocks. |
+| `MAX_PENDING_BLOCKS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | new → `16` blocks | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound mined blocks waiting for contextual commit. |
+| `PENDING_BLOCK_WAIT` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | new → `15 s` | [#748](https://github.com/zakura-core/zakura/pull/748) | Let peers wait for early-advertised blocks below the legacy peer request timeout. |
+| `MAX_INBOUND_RESPONSE_TIME` | `crates/zakurad/src/components/inbound.rs` | `5 s` → `18 s` for block-body requests | [#748](https://github.com/zakura-core/zakura/pull/748) | Give pending block-body requests time to settle while other inbound requests keep the 5-second timeout. |
+| `mining.optimistic_block_inventory` | `crates/zakura-rpc/src/config/mining.rs` | new → `true` | [#748](https://github.com/zakura-core/zakura/pull/748) | Enable inventory after prepared-work validation and state admission while allowing operators to restore commit-first relay. |
+| `MAX_HISTORICAL_TREE_REPLAY_BLOCKS` | `crates/zakura-state/src/constants.rs` | `DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS = 4_000_000` → `100_000` | [#775](https://github.com/zakura-core/zakura/pull/775) | Use one bound for startup grid-gap validation and per-request replay, preventing a grid whose anchors fail verification from falling back to replaying the entire absent band. |
+| `derive_historical_trees` | `crates/zakura-state/src/config.rs` | config knob (default `false`) → removed; derivation is true for an archive node currently on the VCT fast path or carrying a durable VCT fast-sync marker | [#739](https://github.com/zakura-core/zakura/pull/739) | The flag gated nothing an operator can weigh: a derived treestate is served only when it reproduces the authenticated root the node already stores, so it adds no trust and reads no data the node does not already keep. The durable marker keeps an existing absent band serviceable after sync settings change. Mainnet uses the embedded frontier grid, while `state.historical_frontier_artifact` remains an optional override. Added in [#703](https://github.com/zakura-core/zakura/pull/703) and never released; configs carrying the key no longer parse (`deny_unknown_fields`). |
+| `max_historical_tree_replay_blocks` | `crates/zakura-state/src/config.rs` → `constants.rs` | config knob (default 4000000) → removed; the bound is the fixed `MAX_HISTORICAL_TREE_REPLAY_BLOCKS`, retuned to 100,000 in the row above | [#739](https://github.com/zakura-core/zakura/pull/739) | The knob bounded nothing an operator picks: grid spacing is what decides replay cost, so lowering this made requests fail rather than cheaper and raising it did nothing. As a constant it is a backstop at both ends, refusing a grid whose gaps are too wide at startup and a request that would replay too far at serving time. Added in [#703](https://github.com/zakura-core/zakura/pull/703) and never released; configs carrying the key no longer parse (`deny_unknown_fields`). |
+| `TLS_HANDSHAKE_TIMEOUT` | `crates/zakura-rpc/src/indexer/server.rs` | new → `10 s` | [#596](https://github.com/zakura-core/zakura/pull/596) | Drop indexer connections that do not complete the unauthenticated TLS handshake promptly, so stalled handshakes cannot retain a bounded connection slot indefinitely. |
+| `MAX_CONCURRENT_STREAMS_PER_CONNECTION` | `crates/zakura-rpc/src/indexer/server.rs` | new → `64` streams | [#596](https://github.com/zakura-core/zakura/pull/596) | Let trusted indexers multiplex long-lived subscriptions, parallel block-range backfills, and unary queries on one HTTP/2 connection while retaining a finite per-connection task and response-buffer bound. |
+| `MAX_CONNECTIONS` | `crates/zakura-rpc/src/indexer/server.rs` | new → `64` connections | [#596](https://github.com/zakura-core/zakura/pull/596) | Leave ample capacity for trusted indexer clients and operational probes while bounding accepted sockets, TLS handshakes, and HTTP/2 connection tasks server-wide. |
+| `BLOCK_RANGE_CHUNK_SIZE` | `crates/zakura-rpc/src/indexer/methods.rs` | new → `64` (= `RESPONSE_BUFFER_SIZE`) | [#612](https://github.com/zakura-core/zakura/pull/612) | Blocks read from the state per request while streaming `GetBlockRange`: matching the 64-message response buffer means one read can fill the buffer exactly once, so a stream buffers at most about two buffers' worth of blocks server-side while a consumer is slow, without adding a per-read latency cliff. |
 | `BLOCK_PRODUCTION_WEIGHT_RATIO_CAP` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | `4.0` → `10.0` | [#595](https://github.com/zakura-core/zakura/pull/595) | Use the higher interim cap preferred by Zakura and Shielded Labs so high-fee transactions can receive up to ten times the conventional block-production selection weight; longer term, remove the cap to allow a natural fee market. |
 | `EOS_PANIC_AFTER` | `crates/zakurad/src/components/sync/end_of_support.rs` | `18` days → `40` days | [#575](https://github.com/zakura-core/zakura/pull/575) | v1.1.0 releases ~2026-08-05 (estimated height 3,438,427); the 18-day window tuned for v1.0.1's Ironwood span would halt every node ~2026-08-24 (height 3,459,163). 40 days sets the halt at height 3,484,507 (~2026-09-15), the intended support horizon for this release. Warnings keep their 3-day lead via `EOS_WARN_AFTER = EOS_PANIC_AFTER - 3` (start ~2026-09-12). |
 | `OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR` | `crates/zakura-network/src/peer_set/initialize.rs` | `27` of the outbound connection limit (41 outbound peers at the default target size) → `80` of `peerset_initial_target_size`, bounded by the outbound connection limit (80 outbound peers at the default target size) | [#506](https://github.com/zakura-core/zakura/pull/506) | Key the crawler's steady-state outbound target to the operator's configured peer set size rather than to the outbound connection limit, which is a safety ceiling: halving that ceiling in [#478](https://github.com/zakura-core/zakura/pull/478) silently moved the target from 81 to 41 and cut the per-interval dial budget from 47 attempts to 7 on a node holding 34 outbound peers. |

@@ -5,10 +5,76 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{canonical_ip, PrunedBlockNotFoundLogger, ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL};
+use super::{
+    block_by_hash, block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
+    ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL,
+};
+
+#[tokio::test]
+async fn peer_block_lookup_queries_all_active_chains() {
+    use std::sync::Arc;
+
+    use tower::{buffer::Buffer, util::BoxService};
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let expected_block = block.clone();
+    let state = tower::service_fn(move |request| {
+        let expected_block = expected_block.clone();
+        async move {
+            assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(expected_block)))
+        }
+    });
+    let state = Buffer::new(BoxService::new(state), 1);
+
+    assert_eq!(
+        block_by_hash(state, hash)
+            .await
+            .expect("the state lookup succeeds"),
+        Some(block),
+    );
+}
 
 mod fake_peer_set;
 mod real_peer_set;
+
+#[test]
+fn router_consensus_invalid_gossip_keeps_advertiser_score() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let error = zakura_consensus::VerifyBlockError::Block {
+        source: zakura_consensus::BlockError::NoTransactions,
+    };
+    let router_error = zakura_consensus::RouterError::Block {
+        source: Box::new(error),
+    };
+
+    assert_eq!(
+        block_misbehavior(Box::new(router_error), Some(advertiser)),
+        Some((
+            advertiser,
+            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        )),
+    );
+}
+
+#[test]
+fn direct_consensus_invalid_gossip_keeps_advertiser_score() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let error = zakura_consensus::VerifyBlockError::Block {
+        source: zakura_consensus::BlockError::NoTransactions,
+    };
+
+    assert_eq!(
+        block_misbehavior(Box::new(error), Some(advertiser)),
+        Some((
+            advertiser,
+            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        )),
+    );
+}
 
 #[test]
 fn pruned_block_not_found_log_is_rate_limited() {

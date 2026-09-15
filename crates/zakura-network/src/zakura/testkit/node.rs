@@ -2,7 +2,7 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
-use iroh::{endpoint::TransportConfig, protocol::Router, NodeAddr, NodeId};
+use iroh::{endpoint::QuicTransportConfig, protocol::Router, EndpointAddr, EndpointId};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -15,9 +15,9 @@ use crate::{
     zakura::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncStartup, DiscoveryService, HeaderRootAuthState, HeaderSyncAction,
-        HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig,
-        ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
+        BlockSyncStartup, DiscoveryService, FullStateFrontiers, HeaderSyncAction, HeaderSyncHandle,
+        HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraHeaderSyncDriverStartup,
         ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
         ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
@@ -49,7 +49,7 @@ impl ZakuraTestNode {
     }
 
     /// Current Iroh node address.
-    pub async fn node_addr(&self) -> NodeAddr {
+    pub async fn node_addr(&self) -> EndpointAddr {
         self.endpoint.node_addr().await
     }
 
@@ -109,6 +109,7 @@ impl ZakuraTestNode {
             self.endpoint.clone(),
             self.discovery.clone(),
             self.limits.clone(),
+            Vec::new(),
         ))
     }
 
@@ -117,10 +118,10 @@ impl ZakuraTestNode {
     pub async fn insert_static_discovery_candidate(
         &self,
         peer: &ZakuraTestNode,
-    ) -> Result<NodeId, BoxError> {
+    ) -> Result<EndpointId, BoxError> {
         let node_addr = peer.node_addr().await;
-        let node_id = node_addr.node_id;
-        self.endpoint.add_node_addr(node_addr.clone())?;
+        let node_id = node_addr.id;
+
         self.discovery.insert_static_candidate(node_addr).await?;
         Ok(node_id)
     }
@@ -135,17 +136,16 @@ impl ZakuraTestNode {
         self.connect_native_to_addr(peer_addr, timeout).await
     }
 
-    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
+    /// Start a native dial to an explicit [`EndpointAddr`] and wait until this node
     /// registers it. Lets tests advertise a specific direct-address list (for
     /// example a decoy address ahead of the reachable one).
     pub async fn connect_native_to_addr(
         &self,
-        peer_addr: NodeAddr,
+        peer_addr: EndpointAddr,
         timeout: Duration,
     ) -> Result<(), BoxError> {
-        self.endpoint.add_node_addr(peer_addr.clone())?;
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
-        let peer_id = peer_addr.node_id.as_bytes().to_vec();
+        let peer_id = peer_addr.id.as_bytes().to_vec();
         let mut peer_set_rx = self.supervisor().subscribe();
 
         let result = tokio::time::timeout(timeout, async {
@@ -215,7 +215,7 @@ pub struct ZakuraTestNodeBuilder {
     seed: u64,
     limits: ZakuraLocalLimits,
     max_connections_per_ip: usize,
-    transport_config: Option<TransportConfig>,
+    transport_config: Option<QuicTransportConfig>,
     legacy_upgrade: bool,
     tracer: JsonlTracer,
     service: Option<Arc<dyn Service>>,
@@ -233,10 +233,10 @@ pub struct ZakuraTestNodeBuilder {
 struct TestHeaderSyncStartup {
     network: Network,
     anchor: (block::Height, block::Hash),
-    frontiers: HeaderSyncFrontiers,
+    frontiers: FullStateFrontiers,
     best_header_tip: Option<(block::Height, block::Hash)>,
     verified_block_tip_hash: block::Hash,
-    header_root_auth: Option<HeaderRootAuthState>,
+    state_driver: Option<ZakuraHeaderSyncDriverStartup>,
 }
 
 impl fmt::Debug for ZakuraTestNodeBuilder {
@@ -316,10 +316,8 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Mutate the transport configuration used by the endpoint factory.
-    pub fn transport(mut self, configure: impl FnOnce(&mut TransportConfig)) -> Self {
-        let mut transport = self.limits.transport_config();
-        configure(&mut transport);
+    /// Set the complete transport configuration used by the endpoint factory.
+    pub fn transport(mut self, transport: QuicTransportConfig) -> Self {
         self.transport_config = Some(transport);
         self
     }
@@ -357,7 +355,7 @@ impl ZakuraTestNodeBuilder {
         mut self,
         network: Network,
         anchor: (block::Height, block::Hash),
-        frontiers: HeaderSyncFrontiers,
+        frontiers: FullStateFrontiers,
         best_header_tip: Option<(block::Height, block::Hash)>,
     ) -> Self {
         self.header_sync = Some(TestHeaderSyncStartup {
@@ -366,16 +364,26 @@ impl ZakuraTestNodeBuilder {
             frontiers,
             best_header_tip,
             verified_block_tip_hash: anchor.1,
-            header_root_auth: None,
+            state_driver: None,
         });
         self
     }
 
-    /// Supply compact durable header-root authentication progress to the test reactor.
-    pub fn header_root_auth_state(mut self, state: HeaderRootAuthState) -> Self {
-        if let Some(header_sync) = self.header_sync.as_mut() {
-            header_sync.header_root_auth = Some(state);
-        }
+    /// Enable the real header-sync service with direct typed state dispatch.
+    pub fn header_sync_state_driver(
+        mut self,
+        network: Network,
+        anchor: (block::Height, block::Hash),
+        state_driver: ZakuraHeaderSyncDriverStartup,
+    ) -> Self {
+        self.header_sync = Some(TestHeaderSyncStartup {
+            network,
+            anchor,
+            frontiers: state_driver.frontiers,
+            best_header_tip: state_driver.best_header_tip,
+            verified_block_tip_hash: state_driver.verified_block_tip_hash,
+            state_driver: Some(state_driver),
+        });
         self
     }
 
@@ -451,7 +459,7 @@ impl ZakuraTestNodeBuilder {
                 frontiers,
                 best_header_tip,
                 verified_block_tip_hash,
-                header_root_auth,
+                state_driver,
             } = header_sync;
             let mut startup = HeaderSyncStartup::new(
                 network,
@@ -464,10 +472,41 @@ impl ZakuraTestNodeBuilder {
             if let Some(request_timeout) = self.header_sync_request_timeout {
                 startup.request_timeout = request_timeout;
             }
-            startup.range_state_actions_enabled = true;
-            startup.header_root_auth = header_root_auth;
-            startup.inbound_new_block_acceptance_enabled = true;
             startup.status_refresh_interval = Duration::from_millis(200);
+            if let Some(state_driver) = state_driver {
+                startup.committed_snapshots = Some(state_driver.committed_snapshots);
+                startup.vct_root_repairs = state_driver.vct_root_repairs;
+                startup.header_chain_port = state_driver.header_chain_port;
+                startup.use_direct_port();
+            } else if frontiers.finalized_height == anchor.0 {
+                let finalized = zakura_header_chain::Frontier::new(anchor.0, anchor.1);
+                let header_best = best_header_tip
+                    .map(|(height, hash)| zakura_header_chain::Frontier::new(height, hash))
+                    .unwrap_or(finalized);
+                let verified_best = zakura_header_chain::Frontier::new(
+                    frontiers.verified_block_tip,
+                    verified_block_tip_hash,
+                );
+                let snapshot = zakura_header_chain::EngineSnapshot {
+                    mode: zakura_header_chain::EngineMode::Integrated,
+                    state_version: zakura_header_chain::StateVersion::new(1),
+                    header_generation: zakura_header_chain::HeaderGeneration::new(1),
+                    verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+                    frontiers: zakura_header_chain::FrontierSet {
+                        finalized,
+                        header_best,
+                        verified_best,
+                    },
+                    header_best_score: zakura_header_chain::ChainScore::new(
+                        zakura_header_chain::SuffixWork::zero(),
+                        header_best.hash,
+                    ),
+                    oldest_retained_height: finalized.height,
+                    alarms: Default::default(),
+                };
+                let (_snapshots_tx, snapshots_rx) = tokio::sync::watch::channel(Some(snapshot));
+                startup.committed_snapshots = Some(snapshots_rx);
+            }
             let shutdown = CancellationToken::new();
             startup.shutdown = shutdown.clone();
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
@@ -521,6 +560,8 @@ impl ZakuraTestNodeBuilder {
             self.block_sync_config.clone(),
             base_service,
             discovery_service,
+            None,
+            Vec::new(),
         )?;
         let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),
@@ -584,6 +625,7 @@ impl Drop for ZakuraTestNode {
 mod tests {
     use super::super::TEST_NET_TIMEOUT;
     use super::*;
+    use crate::zakura::DEFAULT_ZAKURA_MAX_CONNS_PER_IP;
 
     #[tokio::test]
     async fn legacy_upgrade_builder_fails_loudly() {
@@ -596,12 +638,21 @@ mod tests {
         assert!(error.to_string().contains("connect_via_upgrade"));
     }
 
+    #[test]
+    fn default_test_node_uses_production_per_ip_cap() {
+        // Production handler tests cover supervisor admission.
+        // This regression verifies that the default test builder inherits the production cap.
+        let builder = ZakuraTestNode::builder(9001);
+        let production_cap = Config::default().zakura.max_connections_per_ip();
+
+        assert_eq!(production_cap, DEFAULT_ZAKURA_MAX_CONNS_PER_IP);
+        assert_eq!(builder.max_connections_per_ip, production_cap);
+    }
+
     #[tokio::test]
     async fn per_ip_cap_opt_out_admits_multiple_same_ip_peers() {
-        // Multi-peer loopback harnesses (clusters, gossip meshes) intentionally
-        // admit several same-IP peers and do not exercise the per-IP gate. The
-        // explicit builder opt-out restores that ergonomics on top of the
-        // production-faithful default.
+        // Multi-peer loopback harnesses intentionally admit several peers from one IP.
+        // The explicit builder override disables the production per-IP limit.
         let peer1 = ZakuraTestNode::builder(9101)
             .spawn()
             .await
@@ -630,15 +681,16 @@ mod tests {
 
     // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
     // dials share one source IP (test nodes also bind an IPv6 loopback socket).
-    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
-        let addr = NodeAddr::new(peer_addr.node_id).with_direct_addresses(
-            peer_addr
-                .direct_addresses()
+    fn ipv4_loopback_addr(peer_addr: &EndpointAddr) -> EndpointAddr {
+        let addr = EndpointAddr::new(peer_addr.id).with_addrs(
+            (peer_addr
+                .ip_addrs()
                 .copied()
-                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()))
+            .map(iroh::TransportAddr::Ip),
         );
         assert!(
-            addr.direct_addresses().next().is_some(),
+            addr.ip_addrs().next().is_some(),
             "test peer must advertise an IPv4 loopback direct address",
         );
         addr
@@ -648,66 +700,62 @@ mod tests {
     async fn outbound_dial_charges_confirmed_path_not_advertised_decoy() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        // Regression for the per-IP cap bypass in `serve_native_dial_connection`:
-        // it used to charge the connection to the first *advertised* direct
-        // address instead of the path iroh actually confirmed. A record could
-        // then list an unreachable decoy first and escape the per-IP cap while
-        // being served over a different (shared) address.
+        // `serve_native_dial_connection` previously charged the first advertised address.
+        // Iroh can confirm a different path.
+        // An unreachable first address could therefore bypass the per-IP cap.
         let peer1 = ZakuraTestNode::builder(9201)
             .spawn()
             .await
             .expect("peer1 spawns");
-        let peer2 = ZakuraTestNode::builder(9202)
-            .spawn()
-            .await
-            .expect("peer2 spawns");
         let node = ZakuraTestNode::builder(9203)
             .max_connections_per_ip(1)
             .spawn()
             .await
             .expect("dialer spawns");
 
-        // Advertise peer1 with an unreachable decoy (RFC 5737 TEST-NET-1,
-        // guaranteed non-routable) ahead of its real loopback address. The dial
-        // is served over loopback, so the connection must be charged to
-        // 127.0.0.1, not the decoy.
+        // Advertise an unreachable address before peer1's loopback address.
+        // Charge the confirmed loopback path instead of the advertised address.
+        //
+        // `EndpointAddr::direct_addresses` stores addresses in a `BTreeSet`.
+        // The decoy must sort below 127.0.0.1 to expose the previous behavior.
+        // RFC 6598 shared address space meets that requirement and is not routable.
         let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
-        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
-        let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
-            std::iter::once(decoy).chain(peer1_loopback.direct_addresses().copied()),
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
+        let decoy_first = EndpointAddr::new(peer1_loopback.id).with_addrs(
+            std::iter::once(decoy)
+                .chain(peer1_loopback.ip_addrs().copied())
+                .map(iroh::TransportAddr::Ip),
+        );
+        assert_eq!(
+            decoy_first.ip_addrs().next(),
+            Some(&decoy),
+            "the decoy must sort first, or this test cannot discriminate",
         );
         node.connect_native_to_addr(decoy_first, TEST_NET_TIMEOUT)
             .await
             .expect("peer1 registers over its reachable loopback path despite the decoy");
 
-        // With the connection correctly charged to the confirmed loopback IP,
-        // the per-IP cap of 1 must turn away a second distinct identity from
-        // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
-        // the loopback bucket empty and wrongly admitting peer2.
-        let peer2_addr = ipv4_loopback_addr(&peer2.node_addr().await);
-        let excess = tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::zakura::handler::serve_native_dial_connection(
-                &node.endpoint(),
-                peer2_addr,
-                node.limits(),
-            ),
-        )
-        .await
-        .expect("the rejected one-shot dial must finish promptly");
+        // Assert the per-IP bucket directly.
+        // `serve_native_dial_connection` returns `Ok` after rejection or service completion.
+        // It also deregisters the peer before returning.
+        // Only the bucket state distinguishes the fixed behavior.
+        let supervisor = node.supervisor();
         assert!(
-            excess.is_ok(),
-            "second same-loopback identity must be rejected by the per-IP cap, proving the \
-             first dial was charged to the confirmed path and not the advertised decoy",
+            !supervisor
+                .can_accept_remote_ip_with_in_flight(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+                .await,
+            "peer1 must be charged to the confirmed loopback path, filling the cap-1 bucket for \
+             127.0.0.1 so a second same-loopback identity is turned away",
         );
-        assert_eq!(
-            node.supervisor().registered_ids().await.len(),
-            1,
-            "the rejected peer must not be registered",
+        assert!(
+            supervisor
+                .can_accept_remote_ip_with_in_flight(decoy.ip(), 0)
+                .await,
+            "the advertised decoy address was never connected to, so its bucket must be empty; \
+             charging it there is the bypass this test guards",
         );
 
         node.shutdown().await;
         peer1.shutdown().await;
-        peer2.shutdown().await;
     }
 }

@@ -48,7 +48,7 @@ use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
 use zakura_test::mock_service::MockService;
 
-use crate::{error::TransactionError, transaction::POLL_MEMPOOL_DELAY};
+use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
 
 use super::{check, Request, Verifier};
 
@@ -64,6 +64,527 @@ fn test_timeout() -> std::time::Duration {
         std::time::Duration::from_secs(150)
     } else {
         std::time::Duration::from_secs(30)
+    }
+}
+
+fn block_lookup_fixture(
+    input_count: u32,
+    known_every: u32,
+) -> (Request, HashMap<transparent::OutPoint, transparent::Utxo>) {
+    block_lookup_fixture_from(input_count, known_every, 0)
+}
+
+fn block_lookup_fixture_from(
+    input_count: u32,
+    known_every: u32,
+    first_input: u32,
+) -> (Request, HashMap<transparent::OutPoint, transparent::Utxo>) {
+    let mut inputs = Vec::new();
+    let mut known_utxos = HashMap::new();
+    let mut expected = HashMap::new();
+    for index in first_input..first_input + input_count {
+        let (input, _, utxos) = mock_transparent_transfer(
+            Height(1),
+            true,
+            index,
+            Amount::try_from(u64::from(index) + 1).unwrap(),
+        );
+        inputs.push(input);
+        for (outpoint, utxo) in utxos {
+            expected.insert(outpoint, utxo.utxo.clone());
+            if known_every != 0 && index % known_every == 0 {
+                known_utxos.insert(outpoint, utxo);
+            }
+        }
+    }
+    let transaction = Arc::new(Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        inputs,
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(2),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    });
+    let request = Request::Block {
+        transaction_hash: transaction.hash(),
+        transaction,
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        known_utxos: Arc::new(known_utxos),
+        height: Height(2),
+        time: Utc::now(),
+    };
+    (request, expected)
+}
+
+#[tokio::test]
+async fn block_utxo_lookups_are_bounded_and_preserve_input_order() {
+    for input_count in [0, 1, 2, 63, 64, 65, 129] {
+        for known_every in [0, 1, 3] {
+            let (request, expected) = block_lookup_fixture(input_count, known_every);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            let expected_outputs: Vec<_> = transaction
+                .inputs()
+                .iter()
+                .map(|input| expected[&input.outpoint().unwrap()].output.clone())
+                .collect();
+            let sighash = |outputs| {
+                zakura_chain::transaction::SigHasher::new(
+                    transaction,
+                    NetworkUpgrade::Nu5,
+                    Arc::new(outputs),
+                )
+                .unwrap()
+                .sighash(HashType::ALL, None)
+            };
+            let expected_sighash = sighash(expected_outputs.clone());
+            if input_count > 1 {
+                let mut reversed = expected_outputs.clone();
+                reversed.reverse();
+                assert_ne!(sighash(reversed), expected_sighash);
+            }
+            let transaction = transaction.clone();
+            let mut remaining = expected.len() - request.known_utxos().len();
+            let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let state = service_fn(move |request| {
+                let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                    panic!("block lookups must use AwaitUtxo")
+                };
+                let (respond, response) = tokio::sync::oneshot::channel();
+                requests.send((outpoint, respond)).unwrap();
+                async move { response.await.unwrap() }
+            });
+            let lookup = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            );
+            futures::pin_mut!(lookup);
+
+            while remaining > 0 {
+                tokio::task::yield_now().await;
+                assert!(futures::poll!(&mut lookup).is_pending());
+                let mut batch = Vec::new();
+                while let Ok(pending) = received.try_recv() {
+                    batch.push(pending);
+                }
+                // No response is available until the entire window has started.
+                assert_eq!(
+                    batch.len(),
+                    remaining.min(64),
+                    "inputs={input_count}, known_every={known_every}, remaining={remaining}"
+                );
+                remaining -= batch.len();
+                for (outpoint, respond) in batch.into_iter().rev() {
+                    respond
+                        .send(Ok(zakura_state::Response::Utxo(
+                            expected[&outpoint].clone(),
+                        )))
+                        .unwrap();
+                }
+            }
+
+            let (utxos, outputs, mempool_outpoints) =
+                timeout(test_timeout(), lookup).await.unwrap().unwrap();
+            assert_eq!(utxos, expected);
+            assert_eq!(outputs, expected_outputs);
+            assert_eq!(
+                zakura_chain::transaction::SigHasher::new(
+                    &transaction,
+                    NetworkUpgrade::Nu5,
+                    Arc::new(outputs),
+                )
+                .unwrap()
+                .sighash(HashType::ALL, None),
+                expected_sighash,
+            );
+            assert!(mempool_outpoints.is_empty());
+            assert!(received.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn block_utxo_lookups_wait_for_readiness_once_per_transaction() {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    #[derive(Clone)]
+    struct PendingState(Arc<AtomicUsize>);
+
+    impl Service<zakura_state::Request> for PendingState {
+        type Response = zakura_state::Response;
+        type Error = BoxError;
+        type Future = futures::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+
+        fn call(&mut self, _: zakura_state::Request) -> Self::Future {
+            panic!("state has not admitted a request")
+        }
+    }
+
+    for transaction_count in [1, 4, 16] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut lookups = Vec::new();
+        for index in 0..transaction_count {
+            let (request, _) = block_lookup_fixture_from(129, 0, index * 129);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            lookups.push(Box::pin(Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(
+                    PendingState(polls.clone()),
+                    super::UTXO_LOOKUP_TIMEOUT,
+                ),
+                None,
+            )));
+        }
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            usize::try_from(transaction_count).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn block_utxo_aggregate_windows_are_independent_and_cancel_together() {
+    for transaction_count in [2, 8, 16] {
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let state = service_fn(move |request| {
+            let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                panic!("block lookups use AwaitUtxo")
+            };
+            let (respond, response) = tokio::sync::oneshot::channel();
+            requests.send((outpoint, respond)).unwrap();
+            async move { response.await.unwrap() }
+        });
+        let mut lookups = Vec::new();
+        let mut expected = HashMap::new();
+        for index in 0..transaction_count {
+            let (request, utxos) = block_lookup_fixture_from(1001, 0, index * 1001);
+            expected.extend(utxos);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            lookups.push(Box::pin(Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(state.clone(), super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            )));
+        }
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        let mut pending = Vec::new();
+        while let Ok(request) = received.try_recv() {
+            pending.push(request);
+        }
+        // The bound multiplies across transactions; it is not a shared limit.
+        assert_eq!(
+            pending.len(),
+            usize::try_from(transaction_count).unwrap() * 64
+        );
+
+        // One completion admits one replacement while every other request waits.
+        let (outpoint, respond) = pending.pop().unwrap();
+        respond
+            .send(Ok(zakura_state::Response::Utxo(
+                expected[&outpoint].clone(),
+            )))
+            .unwrap();
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        pending.push(received.try_recv().unwrap());
+        assert!(received.try_recv().is_err());
+
+        // A failed transaction cancels its own window without cancelling its peers.
+        let (_, respond) = pending.remove(0);
+        respond
+            .send(Err(std::io::Error::other("injected state error").into()))
+            .unwrap();
+        assert!(matches!(
+            futures::poll!(&mut lookups[0]),
+            std::task::Poll::Ready(Err(_))
+        ));
+        for lookup in &mut lookups[1..] {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|(_, respond)| respond.is_closed())
+                .count(),
+            63
+        );
+
+        drop(lookups);
+        assert!(pending.iter().all(|(_, respond)| respond.is_closed()));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_utxo_lookup_failure_cancels_pending_requests() {
+    for input_count in [1, 65] {
+        for expire in [false, true] {
+            let (request, _) = block_lookup_fixture(input_count, 0);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let state = service_fn(move |_| {
+                let (respond, response) = tokio::sync::oneshot::channel();
+                requests.send(respond).unwrap();
+                async move { response.await.unwrap() }
+            });
+            let lookup = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            );
+            futures::pin_mut!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending());
+            let mut pending = Vec::new();
+            while let Ok(respond) = received.try_recv() {
+                pending.push(respond);
+            }
+            assert_eq!(pending.len(), usize::try_from(input_count).unwrap().min(64));
+            if expire {
+                tokio::time::advance(super::UTXO_LOOKUP_TIMEOUT).await;
+            } else {
+                pending
+                    .pop()
+                    .unwrap()
+                    .send(Err("lookup failed".into()))
+                    .unwrap();
+            }
+            let error = lookup.await.unwrap_err();
+            if expire {
+                assert!(matches!(error, TransactionError::TransparentInputNotFound));
+            } else {
+                assert!(error.to_string().contains("lookup failed"), "{error}");
+            }
+            assert!(pending.iter().all(tokio::sync::oneshot::Sender::is_closed));
+            assert!(received.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn block_utxo_lookup_refills_window_and_cancels_on_drop() {
+    let (request, expected) = block_lookup_fixture(129, 0);
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let state = service_fn(move |request| {
+        let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+            panic!("block lookups must use AwaitUtxo")
+        };
+        let (respond, response) = tokio::sync::oneshot::channel();
+        requests.send((outpoint, respond)).unwrap();
+        async move { response.await.unwrap() }
+    });
+    let mut lookup = Box::pin(Verifier::<
+        _,
+        tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+    >::spent_utxos(
+        request.transaction(),
+        request,
+        tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+        None,
+    ));
+    assert!(futures::poll!(&mut lookup).is_pending());
+    let mut pending = Vec::new();
+    while let Ok(request) = received.try_recv() {
+        pending.push(request);
+    }
+    assert_eq!(pending.len(), 64);
+
+    // Keep the first 63 requests blocked while completing each new tail request.
+    for _ in 0..65 {
+        let (outpoint, respond) = pending.pop().unwrap();
+        respond
+            .send(Ok(zakura_state::Response::Utxo(
+                expected[&outpoint].clone(),
+            )))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(futures::poll!(&mut lookup).is_pending());
+        pending.push(
+            received
+                .try_recv()
+                .expect("one completed lookup must free one slot"),
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "the window must remain bounded"
+        );
+    }
+
+    drop(lookup);
+    assert!(pending.iter().all(|(_, respond)| respond.is_closed()));
+}
+
+#[tokio::test]
+async fn mempool_utxo_lookups_remain_serial_and_preserve_input_order() {
+    let (block_request, expected) = block_lookup_fixture(4, 0);
+    let transaction = block_request.transaction();
+    let outpoints: Vec<_> = transaction
+        .inputs()
+        .iter()
+        .map(|input| input.outpoint().unwrap())
+        .collect();
+    let expected_outputs: Vec<_> = outpoints
+        .iter()
+        .map(|outpoint| expected[outpoint].output.clone())
+        .collect();
+    let (state_requests, mut state_received) = tokio::sync::mpsc::unbounded_channel();
+    let state = service_fn(move |request| {
+        let zakura_state::Request::UnspentBestChainUtxo(outpoint) = request else {
+            panic!("mempool lookups must use UnspentBestChainUtxo")
+        };
+        let (respond, response) = tokio::sync::oneshot::channel();
+        state_requests.send((outpoint, respond)).unwrap();
+        async move { response.await.unwrap() }
+    });
+    let (mempool_requests, mut mempool_received) = tokio::sync::mpsc::unbounded_channel();
+    let mempool = service_fn(move |request| {
+        let mempool::Request::AwaitOutput(outpoint) = request else {
+            panic!("missing chain outputs must use AwaitOutput")
+        };
+        let (respond, response) = tokio::sync::oneshot::channel();
+        mempool_requests.send((outpoint, respond)).unwrap();
+        async move { response.await.unwrap() }
+    });
+    let request = Request::Mempool {
+        transaction: transaction.clone().into(),
+        height: Height(2),
+    };
+    let lookup = Verifier::spent_utxos(
+        transaction,
+        request,
+        tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+        Some(tower::timeout::Timeout::new(
+            mempool,
+            super::MEMPOOL_OUTPUT_LOOKUP_TIMEOUT,
+        )),
+    );
+    futures::pin_mut!(lookup);
+    for (index, expected_outpoint) in outpoints.iter().enumerate() {
+        assert!(futures::poll!(&mut lookup).is_pending());
+        let (outpoint, respond) = state_received.try_recv().unwrap();
+        assert_eq!(outpoint, *expected_outpoint);
+        assert!(state_received.try_recv().is_err());
+        assert!(mempool_received.try_recv().is_err());
+        let utxo = (index % 2 == 1).then(|| expected[&outpoint].clone());
+        respond
+            .send(Ok::<_, BoxError>(
+                zakura_state::Response::UnspentBestChainUtxo(utxo),
+            ))
+            .unwrap();
+    }
+    for index in [0, 2] {
+        assert!(futures::poll!(&mut lookup).is_pending());
+        let (outpoint, respond) = mempool_received.try_recv().unwrap();
+        assert_eq!(outpoint, outpoints[index]);
+        assert!(mempool_received.try_recv().is_err());
+        respond
+            .send(Ok::<_, BoxError>(mempool::Response::UnspentOutput(
+                expected[&outpoint].output.clone(),
+            )))
+            .unwrap();
+    }
+    let (utxos, outputs, mempool_outpoints) =
+        timeout(test_timeout(), lookup).await.unwrap().unwrap();
+    assert_eq!(outputs, expected_outputs);
+    assert_eq!(mempool_outpoints, vec![outpoints[0], outpoints[2]]);
+    for index in [0, 2] {
+        assert_eq!(
+            utxos[&outpoints[index]],
+            transparent::Utxo::new(expected_outputs[index].clone(), Height(2), false)
+        );
+    }
+    for index in [1, 3] {
+        assert_eq!(utxos[&outpoints[index]], expected[&outpoints[index]]);
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual lookup timing comparison; run with --ignored --nocapture"]
+#[allow(clippy::print_stdout)]
+async fn block_utxo_lookup_timing() {
+    for (input_count, known_every, delayed, iterations) in [
+        (0, 0, false, 100_000),
+        (1, 1, false, 100_000),
+        (1, 0, false, 100_000),
+        (4, 0, false, 100_000),
+        (64, 0, false, 1000),
+        (1001, 1, false, 1000),
+        (1001, 0, false, 1000),
+        (1001, 0, true, 3),
+    ] {
+        let (request, expected) = block_lookup_fixture(input_count, known_every);
+        let Request::Block { transaction, .. } = &request else {
+            unreachable!()
+        };
+        let expected = Arc::new(expected);
+        let state = service_fn(move |request| {
+            let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                panic!("block lookups must use AwaitUtxo")
+            };
+            let utxo = expected[&outpoint].clone();
+            async move {
+                if delayed {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Ok::<_, BoxError>(zakura_state::Response::Utxo(utxo))
+            }
+        });
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let result = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request.clone(),
+                tower::timeout::Timeout::new(state.clone(), super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            )
+            .await
+            .unwrap();
+            std::hint::black_box(result);
+        }
+        println!(
+            "inputs={input_count} known_every={known_every} delayed={delayed}: {:?}/transaction",
+            start.elapsed() / iterations
+        );
     }
 }
 
@@ -3132,6 +3653,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
             (valid_bundle_one, valid_bundle_two, valid_sighash)
         };
+        let valid_tx_id = transaction.unmined_id();
 
         modify_first_sapling_spend_proof(
             Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
@@ -3158,6 +3680,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
             .expect("test fixture has Sapling shielded data");
         let sighash = sighasher.sighash(HashType::ALL, None);
         drop(sighasher);
+        let tx_id = transaction.unmined_id();
 
         let mut verifier = sapling_crypto::BatchValidator::default();
         assert!(
@@ -3167,7 +3690,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
         let mut batch_verifier = crate::primitives::sapling::Verifier::default();
         let batch_result = batch_verifier.call(BatchControl::Item(
-            crate::primitives::sapling::Item::new(batch_bundle, sighash),
+            crate::primitives::sapling::Item::new(batch_bundle, sighash, tx_id),
         ));
         let flush_result = batch_verifier.call(BatchControl::Flush);
         let (batch_result, flush_result) = futures::join!(batch_result, flush_result);
@@ -3178,18 +3701,18 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
         );
 
         let single_result = crate::primitives::sapling::verify_single(
-            crate::primitives::sapling::Item::new(single_bundle, sighash),
+            crate::primitives::sapling::Item::new(single_bundle, sighash, tx_id),
         )
         .await;
         assert_sapling_verification_error(
             single_result.expect_err("corrupted Sapling proof must be rejected"),
         );
 
-        let invalid_item = crate::primitives::sapling::Item::new(fallback_bundle, sighash);
+        let invalid_item = crate::primitives::sapling::Item::new(fallback_bundle, sighash, tx_id);
         let items = vec![
-            crate::primitives::sapling::Item::new(valid_bundle_one, valid_sighash),
+            crate::primitives::sapling::Item::new(valid_bundle_one, valid_sighash, valid_tx_id),
             invalid_item.clone(),
-            crate::primitives::sapling::Item::new(valid_bundle_two, valid_sighash),
+            crate::primitives::sapling::Item::new(valid_bundle_two, valid_sighash, valid_tx_id),
         ];
         let expected_results: Vec<_> = futures::future::join_all(
             items
@@ -3336,7 +3859,7 @@ fn v4_with_malformed_sapling_proof_returns_typed_error() {
         );
 
         let result = crate::primitives::sapling::verify_single(
-            crate::primitives::sapling::Item::new(bundle, sighash),
+            crate::primitives::sapling::Item::new(bundle, sighash, transaction.unmined_id()),
         )
         .await;
         assert_sapling_verification_error(
@@ -4159,68 +4682,99 @@ async fn orchard_disabling_soft_fork_accepts_non_orchard_transactions() {
 /// Mirrors the zcashd boundary test: the soft fork must accept an Orchard
 /// transaction one block below its activation height but reject the same
 /// transaction at the activation height.
-#[tokio::test]
-async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_height() {
+///
+/// Runs on the shared runtime because it verifies a real Orchard bundle, so it can be the test
+/// that first forces the global Halo2 verifier and spawns its batch worker. A per-test runtime
+/// takes that worker down when the test ends, and every later test reaching the same global then
+/// sees the cancelled worker as a verification error rather than a verdict.
+#[test]
+fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_height() {
     let _init_guard = zakura_test::init();
-
-    // Use an unmodified Orchard-only V5 transaction from the test vectors so its
-    // proofs remain valid for the acceptance path.
-    let default_testnet = Network::new_default_testnet();
-    let tx = v5_transactions(default_testnet.block_iter())
-        .rev()
-        .find(|transaction| {
-            transaction.inputs().is_empty()
-                && transaction.outputs().is_empty()
-                && transaction.sapling_spends_per_anchor().next().is_none()
-                && transaction.sapling_outputs().next().is_none()
-                && transaction.joinsplit_count() == 0
-        })
-        .expect("V5 tx with only Orchard actions");
-
-    assert!(
-        tx.orchard_shielded_data().is_some(),
-        "test transaction must contain Orchard actions",
-    );
-
-    let height = tx.expiry_height().expect("V5 tx has an expiry height");
-
-    // The soft fork activates one block above the transaction's height, so it is
-    // inactive for this transaction and verification proceeds normally.
-    let accepting_network = Parameters::build()
-        .with_temporary_orchard_disabling_soft_fork_height(
-            (height + 1).expect("height is too large"),
-        )
-        .to_network()
-        .expect("failed to build configured network");
-
-    assert!(
-        !accepting_network.temporary_orchard_disabling_soft_fork_active(height),
-        "soft fork must be inactive below its activation height",
-    );
-
-    // The only state request for an Orchard-only transaction verified as part of
-    // a block is the nullifier and anchor check.
-    let mut state: MockService<zakura_state::Request, zakura_state::Response, _, _> =
-        MockService::build().for_prop_tests();
-    let accept_verifier = Verifier::new_for_tests(&accepting_network, state.clone());
-
-    tokio::spawn(async move {
-        state
-            .expect_request_that(|req| {
-                matches!(
-                    req,
-                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
-                )
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        // Use an unmodified Orchard-only V5 transaction from the test vectors so its
+        // proofs remain valid for the acceptance path.
+        let default_testnet = Network::new_default_testnet();
+        let tx = v5_transactions(default_testnet.block_iter())
+            .rev()
+            .find(|transaction| {
+                transaction.inputs().is_empty()
+                    && transaction.outputs().is_empty()
+                    && transaction.sapling_spends_per_anchor().next().is_none()
+                    && transaction.sapling_outputs().next().is_none()
+                    && transaction.joinsplit_count() == 0
             })
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
-    });
+            .expect("V5 tx with only Orchard actions");
 
-    let accept_response = accept_verifier
+        assert!(
+            tx.orchard_shielded_data().is_some(),
+            "test transaction must contain Orchard actions",
+        );
+
+        let height = tx.expiry_height().expect("V5 tx has an expiry height");
+
+        // The soft fork activates one block above the transaction's height, so it is
+        // inactive for this transaction and verification proceeds normally.
+        let accepting_network = Parameters::build()
+            .with_temporary_orchard_disabling_soft_fork_height(
+                (height + 1).expect("height is too large"),
+            )
+            .to_network()
+            .expect("failed to build configured network");
+
+        assert!(
+            !accepting_network.temporary_orchard_disabling_soft_fork_active(height),
+            "soft fork must be inactive below its activation height",
+        );
+
+        // The only state request for an Orchard-only transaction verified as part of
+        // a block is the nullifier and anchor check.
+        let mut state: MockService<zakura_state::Request, zakura_state::Response, _, _> =
+            MockService::build().for_prop_tests();
+        let accept_verifier = Verifier::new_for_tests(&accepting_network, state.clone());
+
+        tokio::spawn(async move {
+            state
+                .expect_request_that(|req| {
+                    matches!(
+                        req,
+                        zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                    )
+                })
+                .await
+                .expect("verifier should call mock state service with correct request")
+                .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+        });
+
+        let accept_response = accept_verifier
+            .oneshot(Request::Block {
+                transaction_hash: tx.hash(),
+                transaction: Arc::new(tx.clone()),
+                known_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert!(
+            accept_response.is_ok(),
+            "Orchard transaction must be accepted below the soft fork height, got: {accept_response:?}",
+        );
+
+        // At the activation height the same transaction is rejected. The soft-fork
+        // check runs before any state query, so the state service is never called.
+        let rejecting_network = Parameters::build()
+            .with_temporary_orchard_disabling_soft_fork_height(height)
+            .to_network()
+            .expect("failed to build configured network");
+
+        let reject_response = Verifier::new_for_tests(
+            &rejecting_network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
         .oneshot(Request::Block {
             transaction_hash: tx.hash(),
-            transaction: Arc::new(tx.clone()),
+            transaction: Arc::new(tx),
             known_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
             height,
@@ -4228,39 +4782,14 @@ async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_he
         })
         .await;
 
-    assert!(
-        accept_response.is_ok(),
-        "Orchard transaction must be accepted below the soft fork height, got: {accept_response:?}",
-    );
-
-    // At the activation height the same transaction is rejected. The soft-fork
-    // check runs before any state query, so the state service is never called.
-    let rejecting_network = Parameters::build()
-        .with_temporary_orchard_disabling_soft_fork_height(height)
-        .to_network()
-        .expect("failed to build configured network");
-
-    let reject_response = Verifier::new_for_tests(
-        &rejecting_network,
-        service_fn(|_| async { unreachable!("state service should not be called") }),
-    )
-    .oneshot(Request::Block {
-        transaction_hash: tx.hash(),
-        transaction: Arc::new(tx),
-        known_utxos: Arc::new(HashMap::new()),
-        known_outpoint_hashes: Arc::new(HashSet::new()),
-        height,
-        time: DateTime::<Utc>::MAX_UTC,
-    })
-    .await;
-
-    assert_eq!(
-        reject_response,
-        Err(TransactionError::Other(
-            "transaction has Orchard actions (temporarily disabled)".into()
-        )),
-        "Orchard transaction must be rejected at the soft fork height",
-    );
+        assert_eq!(
+            reject_response,
+            Err(TransactionError::Other(
+                "transaction has Orchard actions (temporarily disabled)".into()
+            )),
+            "Orchard transaction must be rejected at the soft fork height",
+        );
+    });
 }
 
 /// Checks that public-network branch-ID admission switches exactly at NU6.3 activation.
@@ -5378,9 +5907,15 @@ async fn mempool_transaction_with_sufficient_fee_is_rejected_by_script() {
     );
 }
 
-/// Test for CVE-2026-34377 https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-3vmh-33xr-9cqh
+/// Regression test for the whole-transaction mempool bypass removed in Zebra PR #10494.
 ///
-/// Ensure a block with a transaction with garbage Orchard proofs is rejected, even if the mempool has a valid version of the same transaction.
+/// The mock mempool can return a valid transaction with the same txid as the block transaction,
+/// whose authorizing data is corrupted. Current Zakura does not query that verdict during block
+/// verification; if the old bypass is reintroduced, the mock response makes the block skip its
+/// normal checks and this test fails.
+///
+/// This does not populate or exercise the Halo2 proof cache. See
+/// [`the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it`] for that coverage.
 #[tokio::test(flavor = "multi_thread")]
 async fn block_with_garbage_orchard_proofs_is_rejected() {
     use zakura_chain::{primitives::Halo2Proof, transaction::VerifiedUnminedTx};
@@ -5436,7 +5971,8 @@ async fn block_with_garbage_orchard_proofs_is_rejected() {
     }
     assert_eq!(tx.hash(), garbage_tx.hash());
 
-    // simulate valid version in mempool
+    // Arm the mock mempool with a valid same-txid version. The current block verifier does not
+    // query it, but the removed whole-transaction bypass would.
     let spent_output = known_utxos
         .get(&input_outpoint)
         .unwrap()
@@ -5480,31 +6016,14 @@ async fn block_with_garbage_orchard_proofs_is_rejected() {
     assert!(resp.is_err(), "garbage proof must be rejected");
 }
 
-/// Regression test for the mempool-cache expiry bypass vulnerability.
+/// A block transaction mined past its expiry height is rejected.
 ///
-/// A non-coinbase transaction with `nExpiryHeight = H+1` that was cached in the
-/// mempool as valid at height `H+1` can be presented inside a block at height
-/// `H+2`.  The block transaction verifier must re-run the expiry check even
-/// when it hits the mempool cache fast path in `find_verified_unmined_tx`;
-/// skipping that check lets Zebra accept a block that honest nodes reject,
-/// causing a consensus split.
-///
-/// # Attack window
-///
-/// The attack is possible because:
-/// * The mempool is active while Zebra is "close to tip" (not only at exact tip).
-/// * The download/verification pipeline accepts blocks up to
-///   `tip + full_verify_concurrency_limit` ahead of the current tip.
-/// * `find_verified_unmined_tx` returns the cached result before the normal
-///   expiry validation.
-///
-/// Concretely: while Zebra's best tip is still `H`, the mempool can already
-/// hold a `VerifiedUnminedTx` for a transaction with `nExpiryHeight = H+1`.
-/// If the verifier is simultaneously asked to semantically verify a candidate
-/// block at `H+2` that contains the same transaction, the cache hit fires and
-/// the block passes semantic verification with an expired transaction inside.
+/// This is baseline coverage for the height-dependent check. It does not populate either a
+/// transaction-verdict cache or the Halo2 proof cache: the transaction is transparent-only and is
+/// submitted only as a block request. The Halo2 cache expiry regression is covered by
+/// [`the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it`].
 #[tokio::test(flavor = "multi_thread")]
-async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() {
+async fn block_transaction_past_expiry_height_is_rejected() {
     let _init_guard = zakura_test::init();
 
     let network = Network::Mainnet;
@@ -5557,12 +6076,7 @@ async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() 
         .ok()
         .expect("send should succeed");
 
-    // Submit the same transaction as a Block request at expired_block_height
-    // (H+2).  The known_outpoint_hashes set satisfies the dependency check
-    // inside find_verified_unmined_tx so the cache hit fires immediately.
-    //
-    // The verifier must return Err(TransactionError::ExpiredTransaction)
-    // because H+2 > nExpiryHeight.
+    // Submit the transaction at H+2, where it is expired because H+2 > nExpiryHeight.
     let result = timeout(
         test_timeout(),
         verifier.clone().oneshot(Request::Block {
@@ -5579,17 +6093,15 @@ async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() 
 
     // Buffer boxes the service error, so downcast to check the specific variant.
     let err = result.expect_err(
-        "expected block verification to fail for a transaction with \
-         expired nExpiryHeight mined via the mempool cache path",
+        "expected block verification to fail for a transaction with expired nExpiryHeight",
     );
     let tx_err = err
         .downcast::<TransactionError>()
         .expect("error should downcast to TransactionError");
     assert!(
         matches!(*tx_err, TransactionError::ExpiredTransaction { .. }),
-        "expected ExpiredTransaction error for block at height {expired_block_height:?} \
-         with nExpiryHeight {mempool_height:?} via mempool cache; \
-         got: {tx_err:?}"
+        "expected ExpiredTransaction error for block at height {expired_block_height:?} with \
+         nExpiryHeight {mempool_height:?}; got: {tx_err:?}"
     );
 }
 
@@ -5883,4 +6395,734 @@ fn script_sig_args_expected_values() {
     let ms_kind = check::standard_script_kind(&ms_kind)
         .expect("1-of-1 multisig should be a standard script kind");
     assert_eq!(check::script_sig_args_expected(&ms_kind), Some(2));
+}
+
+// The Halo2 proof cache, exercised through the production transaction verifier.
+//
+// The unit tests in `primitives::halo2::tests` drive a hand-built `Cached` over a synthetic inner
+// service. What follows drives the real `Request::Mempool` and `Request::Block` flows over the
+// real global verifier, which is what production uses.
+
+/// The mock state service the cache test verifies against.
+type CacheTestState = MockService<
+    zakura_state::Request,
+    zakura_state::Response,
+    zakura_test::mock_service::PropTestAssertion,
+    BoxError,
+>;
+
+/// The mock mempool service the cache test verifies against.
+type CacheTestMempool = MockService<
+    mempool::Request,
+    mempool::Response,
+    zakura_test::mock_service::PropTestAssertion,
+    BoxError,
+>;
+
+/// The transaction verifier the cache test drives.
+///
+/// Unbuffered, so failures arrive as a typed [`TransactionError`] rather than a boxed one.
+/// Requests are issued in sequence, so one `&mut` handle is enough.
+type CacheTestVerifier = Verifier<CacheTestState, CacheTestMempool>;
+
+/// Returns the real mainnet Orchard transaction that the cache test drives through the verifier.
+///
+/// Selected from the mainnet test blocks for what full verification needs:
+///
+///   * an Orchard bundle, which is what the cache holds;
+///   * no transparent inputs, so its sighash does not depend on previous outputs that the test
+///     vectors do not carry;
+///   * a fee covering its own actions, so the mempool's ZIP-317 policy accepts it; and
+///   * no Sapling bundle, which keeps the test on the Halo2 verifier rather than also loading the
+///     Sapling parameters and batching Groth16 proofs that prove nothing here.
+///
+/// Its proof is NU5-era, so it verifies only under the pre-NU6.2 circuit key, and every height
+/// used with it must be a pre-NU6.2 mainnet height.
+fn cacheable_mainnet_orchard_transaction() -> Transaction {
+    zakura_test::vectors::MAINNET_BLOCKS
+        .values()
+        .flat_map(|bytes| {
+            let block: Block = bytes
+                .zcash_deserialize_into()
+                .expect("hard-coded test vector must deserialize");
+            block.transactions.clone()
+        })
+        .find(|tx| {
+            tx.orchard_shielded_data().is_some()
+                && tx.inputs().is_empty()
+                && !tx.has_sapling_shielded_data()
+                && tx
+                    .value_balance(&HashMap::new())
+                    .ok()
+                    .and_then(|balance| balance.remaining_transaction_value().ok())
+                    .is_some_and(|fee| fee >= zip317::conventional_fee(tx))
+        })
+        .map(|tx| tx.as_ref().clone())
+        .expect("the mainnet test blocks must contain a fee-paying Orchard-only transaction")
+}
+
+/// Returns the Orchard verification item the transaction verifier builds for `tx` at
+/// `network_upgrade`.
+///
+/// Mirrors `Verifier::verify_v5_transaction`: the bundle and the sighash come from one sighasher
+/// over an empty set of previous outputs, which is correct only because
+/// [`cacheable_mainnet_orchard_transaction`] has no transparent inputs.
+fn orchard_item(tx: &Transaction, network_upgrade: NetworkUpgrade) -> primitives::halo2::Item {
+    let sighasher = tx
+        .sighasher(network_upgrade, Arc::new(Vec::new()))
+        .expect("a mainnet Orchard transaction has a sighasher at its own network upgrade");
+    let bundle = sighasher
+        .orchard_bundle()
+        .expect("the transaction was selected for having an Orchard bundle");
+
+    primitives::halo2::Item::new_with_wtx_id(
+        bundle,
+        sighasher.sighash(HashType::ALL, None),
+        tx.into(),
+    )
+}
+
+/// Builds a transaction verifier over mock state and mempool services, and returns the state.
+fn cache_test_verifier() -> (CacheTestVerifier, CacheTestState) {
+    let state: CacheTestState = MockService::build().for_prop_tests();
+    let mempool: CacheTestMempool = MockService::build().for_prop_tests();
+    let (mempool_setup_tx, mempool_setup_rx) = tokio::sync::oneshot::channel();
+
+    let verifier = Verifier::new(&Network::Mainnet, state.clone(), mempool_setup_rx);
+
+    mempool_setup_tx
+        .send(mempool)
+        .ok()
+        .expect("the mempool setup channel must accept the mock");
+
+    (verifier, state)
+}
+
+/// Answers the one state query that verifying a shielded-only transaction from the mempool makes.
+///
+/// Block requests make none: this transaction has no transparent inputs to look up, and the
+/// nullifier and anchor check is a mempool-only query.
+fn respond_to_nullifier_and_anchor_check(state: &CacheTestState) {
+    let mut state = state.clone();
+
+    tokio::spawn(async move {
+        state
+            .expect_request_that(|req| {
+                matches!(
+                    req,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .expect("a mempool verification must check nullifiers and anchors")
+            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    });
+}
+
+/// Verifies `request`, leaving `verifier` usable for the next one.
+async fn verify(
+    verifier: &mut CacheTestVerifier,
+    request: Request,
+) -> Result<super::Response, TransactionError> {
+    verifier
+        .ready()
+        .await
+        .expect("the transaction verifier is always ready")
+        .call(request)
+        .await
+}
+
+/// Returns a block request that mines `tx` at `height`.
+fn block_request(tx: &Transaction, height: block::Height) -> Request {
+    Request::Block {
+        transaction_hash: tx.hash(),
+        transaction: Arc::new(tx.clone()),
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        known_utxos: Arc::new(HashMap::new()),
+        height,
+        time: Utc::now(),
+    }
+}
+
+/// Mutations that must each force a fresh verification.
+///
+/// Every one is a canonical-length bit flip, so the mutated transaction still passes the
+/// structural checks that run before verification. That matters most for the proof:
+/// `shielded_proof_size_is_canonical` rejects a wrong-length proof long before the cache is
+/// consulted, so a garbage-length proof would not exercise the cache at all.
+///
+/// The first three change only authorizing data, which under ZIP 244 leaves the txid unchanged.
+/// That is the shape of CVE-2026-34377, and a cache keyed on the txid would answer all three with
+/// the valid transaction's result. The fourth is the one field of the four that lives outside the
+/// Orchard bundle: it changes the txid component of the witnessed transaction
+/// ID.
+const CACHE_KEY_MUTATIONS: &[(&str, fn(&mut Transaction))] = &[
+    ("Halo2 proof", |tx| {
+        orchard_shielded_data_for_mutation(tx).proof.0[0] ^= 1;
+    }),
+    ("binding signature", |tx| {
+        let data = orchard_shielded_data_for_mutation(tx);
+        let mut bytes = <[u8; 64]>::from(data.binding_sig);
+        bytes[0] ^= 1;
+        data.binding_sig = bytes.into();
+    }),
+    ("spend authorization signature", |tx| {
+        for action in orchard_shielded_data_for_mutation(tx).actions.iter_mut() {
+            let mut bytes = <[u8; 64]>::from(action.spend_auth_sig);
+            bytes[0] ^= 1;
+            action.spend_auth_sig = bytes.into();
+        }
+    }),
+    ("expiry height", |tx| {
+        // Raised rather than lowered, so the transaction still passes the expiry check and
+        // reaches verification. Under ZIP 244 the expiry height is in the sighash, and the
+        // Orchard signatures are verified against that sighash.
+        let raised = (tx
+            .expiry_height()
+            .expect("a V5 transaction has an expiry height")
+            + 1)
+        .expect("a mainnet expiry height is far below the maximum");
+
+        *tx.expiry_height_mut() = raised;
+    }),
+];
+
+/// Returns `tx`'s Orchard shielded data for mutation.
+fn orchard_shielded_data_for_mutation(tx: &mut Transaction) -> &mut orchard::ShieldedData {
+    tx.orchard_shielded_data_mut()
+        .expect("the transaction was selected for having Orchard shielded data")
+}
+
+/// The Halo2 proof cache, exercised end to end through the transaction verifier.
+///
+/// This is one test rather than three because all three claims need the same transaction and a
+/// cold cache for it. The Halo2 verifiers are process-wide `Lazy` statics, so only one test can
+/// ever see that transaction's cache entry cold.
+///
+/// It runs on [`zakura_test::MULTI_THREADED_RUNTIME`] because it reaches a global verifier.
+/// `tower-batch-control` spawns that verifier's batch worker on whichever runtime first touches
+/// it, so a per-test runtime would leave the worker cancelled for every test that ran afterwards.
+///
+/// The three claims, in order:
+///
+///   1. a mempool verification records the proof, and the block that mines the same transaction is
+///      answered from that record instead of verifying the proof again;
+///   2. the record does not carry the transaction past the height-dependent checks: the block one
+///      height past its expiry is still rejected. That is the mempool bypass Zebra removed as a
+///      security fix in PR #10494, and the reason this cache holds a proof rather than a verdict
+///      on a transaction;
+///   3. a transaction with any verification input mutated never inherits the record.
+#[test]
+fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
+    let _init_guard = zakura_test::init();
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let (mut verifier, state) = cache_test_verifier();
+
+        let tx = cacheable_mainnet_orchard_transaction();
+        let expiry_height = tx
+            .expiry_height()
+            .expect("a V5 transaction has an expiry height");
+        let network_upgrade = NetworkUpgrade::current(&Network::Mainnet, expiry_height);
+        let item = orchard_item(&tx, network_upgrade);
+        assert_eq!(
+            primitives::halo2::inner_calls_for(network_upgrade, &item),
+            0,
+            "this transaction's bundle must not have been verified before this test"
+        );
+
+        // 1. The mempool verification is the only one that reaches the Halo2 verifier.
+        respond_to_nullifier_and_anchor_check(&state);
+        verify(
+            &mut verifier,
+            Request::Mempool {
+                transaction: tx.clone().into(),
+                height: expiry_height,
+            },
+        )
+        .await
+        .expect("a real mainnet Orchard transaction must verify at its expiry height");
+
+        assert_eq!(
+            primitives::halo2::inner_calls_for(network_upgrade, &item),
+            1,
+            "the mempool verification must reach the inner Halo2 verifier"
+        );
+
+        verify(&mut verifier, block_request(&tx, expiry_height))
+            .await
+            .expect("the same transaction must verify in a block");
+
+        assert_eq!(
+            primitives::halo2::inner_calls_for(network_upgrade, &item),
+            1,
+            "the block verification must be answered from the cache"
+        );
+
+        // 2. The cached proof does not carry the transaction past the expiry check.
+        let too_late =
+            (expiry_height + 1).expect("a mainnet expiry height is far below the maximum");
+        let error = verify(&mut verifier, block_request(&tx, too_late))
+            .await
+            .expect_err("a transaction mined past its expiry height must be rejected");
+
+        assert_eq!(
+            error,
+            TransactionError::ExpiredTransaction {
+                expiry_height,
+                block_height: too_late,
+                transaction_hash: tx.hash(),
+            },
+            "the rejection must be the expiry rule, not some other failure"
+        );
+
+        // 3. No mutated transaction inherits the cached result.
+        for (mutated_field, mutate) in CACHE_KEY_MUTATIONS {
+            let mut mutated_tx = tx.clone();
+            mutate(&mut mutated_tx);
+            let mutated_item = orchard_item(&mutated_tx, network_upgrade);
+
+            // A collision here would already be the failure: the mutation would inherit the
+            // valid transaction's result instead of being verified.
+            assert_eq!(
+                primitives::halo2::inner_calls_for(network_upgrade, &mutated_item),
+                0,
+                "the {mutated_field} mutation must get a different cache key"
+            );
+
+            let Err(error) = verify(&mut verifier, block_request(&mutated_tx, expiry_height)).await
+            else {
+                panic!("a transaction with a mutated {mutated_field} must be rejected");
+            };
+
+            assert_eq!(
+                error,
+                TransactionError::Halo2VerificationFailed,
+                "the {mutated_field} twin must fail Orchard verification"
+            );
+
+            assert_eq!(
+                primitives::halo2::inner_calls_for(network_upgrade, &mutated_item),
+                1,
+                "the {mutated_field} mutation must reach the inner Halo2 verifier"
+            );
+        }
+    });
+}
+
+/// Returns the real mainnet Sapling transaction that the Sapling cache test drives through the
+/// verifier, with the network upgrade whose branch id its signatures commit to.
+///
+/// Selected from the mainnet test blocks for what full verification needs:
+///
+///   * a Sapling bundle with spends, which is what the cache holds;
+///   * no transparent inputs, so its sighash does not depend on previous outputs that the test
+///     vectors do not carry;
+///   * no Sprout JoinSplits and no Orchard bundle, which keeps the test on the Sapling verifier;
+///     and
+///   * a fee covering its own inputs and outputs, so the mempool's ZIP-317 policy accepts it.
+///
+/// It is taken from the front of the test vectors on purpose. The other tests that verify a real
+/// Sapling transaction successfully take the last matching one, so this transaction reaches the
+/// process-wide Sapling verifier only here and its cache entry is cold when this test starts.
+/// That precondition is asserted rather than assumed, because it depends on which transactions
+/// the vectors happen to contain.
+fn cacheable_mainnet_sapling_transaction() -> (NetworkUpgrade, Transaction) {
+    let selected = mainnet_sapling_transactions_with_spends()
+        .into_iter()
+        .find(|(_, tx)| {
+            tx.joinsplit_count() == 0
+                && tx.orchard_shielded_data().is_none()
+                && tx
+                    .value_balance(&HashMap::new())
+                    .ok()
+                    .and_then(|balance| balance.remaining_transaction_value().ok())
+                    .is_some_and(|fee| fee >= zip317::conventional_fee(tx))
+        })
+        .expect("the mainnet test blocks must contain a fee-paying Sapling-only transaction");
+
+    assert_cache_fixture_is_unshared(&selected.1);
+
+    selected
+}
+
+/// Returns the mainnet V5 Sapling transaction the V5 cache test drives through the verifier.
+///
+/// Same requirements as [`cacheable_mainnet_sapling_transaction`] minus the fee: no V5 Sapling
+/// transaction in the vectors pays the conventional fee, so the V5 test uses block requests only
+/// and never reaches the mempool's ZIP-317 policy.
+fn cacheable_mainnet_v5_sapling_transaction() -> (NetworkUpgrade, Transaction) {
+    let selected = mainnet_sapling_transactions_with_spends()
+        .into_iter()
+        .find(|(_, tx)| {
+            matches!(tx, Transaction::V5 { .. })
+                && tx.joinsplit_count() == 0
+                && tx.orchard_shielded_data().is_none()
+        })
+        .expect("the mainnet test blocks must contain a V5 Sapling-only transaction with spends");
+
+    assert_cache_fixture_is_unshared(&selected.1);
+
+    selected
+}
+
+/// Returns every mainnet test transaction with Sapling spends and no transparent inputs, with the
+/// network upgrade each one was mined under.
+fn mainnet_sapling_transactions_with_spends() -> Vec<(NetworkUpgrade, Transaction)> {
+    test_transactions(&Network::Mainnet)
+        .filter(|(_, tx)| tx.sapling_spends_per_anchor().next().is_some() && tx.inputs().is_empty())
+        .map(|(height, tx)| {
+            (
+                NetworkUpgrade::current(&Network::Mainnet, height),
+                tx.as_ref().clone(),
+            )
+        })
+        .collect()
+}
+
+/// Asserts that no other test verifies `fixture` successfully, so its cache entry is cold.
+///
+/// The other tests that put a real Sapling transaction through the verifier and expect it to pass
+/// select with `.rev()`, so they all share one fixture: the last transaction with Sapling spends
+/// and no transparent inputs. A cache test whose fixture is that transaction would depend on test
+/// order for its cold-cache precondition.
+fn assert_cache_fixture_is_unshared(fixture: &Transaction) {
+    let shared = mainnet_sapling_transactions_with_spends()
+        .pop()
+        .expect("the mainnet test blocks contain Sapling transactions with spends");
+
+    assert_ne!(
+        fixture.hash(),
+        shared.1.hash(),
+        "the cache fixture must not be the transaction the other Sapling tests verify, or its \
+         cache entry would not be cold when this test starts"
+    );
+}
+
+/// Returns the Sapling verification item the transaction verifier builds for `tx` at
+/// `network_upgrade`.
+///
+/// Mirrors `Verifier::verify_v4_transaction`: the bundle and the sighash come from one sighasher
+/// over an empty set of previous outputs, which is correct only because
+/// [`cacheable_mainnet_sapling_transaction`] has no transparent inputs.
+fn sapling_item(tx: &Transaction, network_upgrade: NetworkUpgrade) -> primitives::sapling::Item {
+    let sighasher = tx
+        .sighasher(network_upgrade, Arc::new(Vec::new()))
+        .expect("a mainnet Sapling transaction has a sighasher at its own network upgrade");
+    let bundle = sighasher
+        .sapling_bundle()
+        .expect("the transaction was selected for having a Sapling bundle");
+
+    primitives::sapling::Item::new(
+        bundle,
+        sighasher.sighash(HashType::ALL, None),
+        tx.unmined_id(),
+    )
+}
+
+/// Returns `tx`'s V4 Sapling shielded data for mutation.
+fn sapling_shielded_data_for_mutation(
+    tx: &mut Transaction,
+) -> &mut sapling::ShieldedData<sapling::PerSpendAnchor> {
+    let Transaction::V4 {
+        sapling_shielded_data: Some(shielded_data),
+        ..
+    } = tx
+    else {
+        panic!("the transaction was selected for being a V4 transaction with Sapling data")
+    };
+
+    shielded_data
+}
+
+/// Applies `mutate` to the first Sapling spend of `tx`.
+fn mutate_first_sapling_spend(
+    tx: &mut Transaction,
+    mutate: impl FnOnce(&mut sapling::Spend<sapling::PerSpendAnchor>),
+) {
+    let sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } =
+        &mut sapling_shielded_data_for_mutation(tx).transfers
+    else {
+        panic!("the transaction was selected for having Sapling spends")
+    };
+
+    let mut spends_vec = spends.as_slice().to_vec();
+    mutate(&mut spends_vec[0]);
+    *spends = AtLeastOne::from_vec(spends_vec).expect("replacing a field keeps at least one spend");
+}
+
+/// Mutations that must each force a fresh Sapling verification.
+///
+/// Every one is a single bit flip in authorizing data, so the mutated transaction still passes
+/// the structural checks that run before verification — including the not-small-order check on
+/// `cv` and `epk`, which neither proofs nor signatures are part of.
+///
+/// All three are inside a v1-v4 transaction ID, which is the hash of the whole serialized
+/// transaction. That is why a Sapling bundle in a V4 transaction can be cached at all: it has no
+/// witnessed transaction ID, and its txid is what commits to its authorizing data.
+const SAPLING_CACHE_KEY_MUTATIONS: &[(&str, fn(&mut Transaction))] = &[
+    ("spend proof", |tx| {
+        mutate_first_sapling_spend(tx, |spend| spend.zkproof.0[0] ^= 1);
+    }),
+    ("spend authorization signature", |tx| {
+        mutate_first_sapling_spend(tx, |spend| {
+            let mut bytes = <[u8; 64]>::from(spend.spend_auth_sig);
+            bytes[0] ^= 1;
+            spend.spend_auth_sig = bytes.into();
+        });
+    }),
+    ("output proof", |tx| {
+        let sapling::TransferData::SpendsAndMaybeOutputs { maybe_outputs, .. } =
+            &mut sapling_shielded_data_for_mutation(tx).transfers
+        else {
+            panic!("the transaction was selected for having Sapling spends")
+        };
+
+        maybe_outputs
+            .first_mut()
+            .expect("the fixture has Sapling outputs")
+            .zkproof
+            .0[0] ^= 1;
+    }),
+    ("binding signature", |tx| {
+        let data = sapling_shielded_data_for_mutation(tx);
+        let mut bytes = <[u8; 64]>::from(data.binding_sig);
+        bytes[0] ^= 1;
+        data.binding_sig = bytes.into();
+    }),
+];
+
+/// The Sapling bundle cache, exercised end to end through the transaction verifier.
+///
+/// This is the Sapling counterpart of
+/// [`the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it`], and it is one test for
+/// the same reason: all three claims need the same transaction and a cold cache for it.
+///
+/// It also covers what Sapling does not share with Orchard. Its fixture is a V4 transaction,
+/// which has no witnessed transaction ID, so its cache key is built from the legacy transaction
+/// ID instead — and these mutations are the evidence that the legacy ID commits to the
+/// authorizing data the witnessed ID's digest would have covered.
+///
+/// The three claims, in order:
+///
+///   1. a mempool verification records the bundle, and the block that mines the same transaction
+///      is answered from that record instead of verifying the bundle again;
+///   2. the record does not carry the transaction past the height-dependent checks: the block one
+///      height past its expiry is still rejected;
+///   3. a transaction with any verification input mutated never inherits the record.
+#[test]
+fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
+    let _init_guard = zakura_test::init();
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let (mut verifier, state) = cache_test_verifier();
+
+        let (network_upgrade, tx) = cacheable_mainnet_sapling_transaction();
+        let expiry_height = tx
+            .expiry_height()
+            .expect("the fixture is an Overwinter-onward transaction with an expiry height");
+        assert_eq!(
+            NetworkUpgrade::current(&Network::Mainnet, expiry_height),
+            network_upgrade,
+            "the expiry height must be in the same upgrade as the block that mined the fixture, \
+             or its V4 sighash would commit to a different branch id"
+        );
+
+        let item = sapling_item(&tx, network_upgrade);
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            0,
+            "this transaction's bundle must not have been verified before this test"
+        );
+
+        // 1. The mempool verification is the only one that reaches the Sapling verifier.
+        respond_to_nullifier_and_anchor_check(&state);
+        verify(
+            &mut verifier,
+            Request::Mempool {
+                transaction: tx.clone().into(),
+                height: expiry_height,
+            },
+        )
+        .await
+        .expect("a real mainnet Sapling transaction must verify at its expiry height");
+
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            1,
+            "the mempool verification must reach the inner Sapling verifier"
+        );
+
+        verify(&mut verifier, block_request(&tx, expiry_height))
+            .await
+            .expect("the same transaction must verify in a block");
+
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            1,
+            "the block verification must be answered from the cache"
+        );
+
+        // 2. The cached bundle does not carry the transaction past the expiry check.
+        let too_late =
+            (expiry_height + 1).expect("a mainnet expiry height is far below the maximum");
+        let error = verify(&mut verifier, block_request(&tx, too_late))
+            .await
+            .expect_err("a transaction mined past its expiry height must be rejected");
+
+        assert_eq!(
+            error,
+            TransactionError::ExpiredTransaction {
+                expiry_height,
+                block_height: too_late,
+                transaction_hash: tx.hash(),
+            },
+            "the rejection must be the expiry rule, not some other failure"
+        );
+
+        // 3. No mutated transaction inherits the cached result.
+        for (mutated_field, mutate) in SAPLING_CACHE_KEY_MUTATIONS {
+            let mut mutated_tx = tx.clone();
+            mutate(&mut mutated_tx);
+            let mutated_item = sapling_item(&mutated_tx, network_upgrade);
+
+            // A collision here would already be the failure: the mutation would inherit the
+            // valid transaction's result instead of being verified.
+            assert_eq!(
+                primitives::sapling::inner_calls_for(&mutated_item),
+                0,
+                "the {mutated_field} mutation must get a different cache key"
+            );
+
+            let Err(error) = verify(&mut verifier, block_request(&mutated_tx, expiry_height)).await
+            else {
+                panic!("a transaction with a mutated {mutated_field} must be rejected");
+            };
+
+            assert_eq!(
+                error,
+                TransactionError::SaplingVerificationFailed,
+                "the {mutated_field} twin must fail Sapling verification"
+            );
+
+            assert_eq!(
+                primitives::sapling::inner_calls_for(&mutated_item),
+                1,
+                "the {mutated_field} mutation must reach the inner Sapling verifier"
+            );
+        }
+    });
+}
+
+/// The Sapling cache over a V5 transaction, whose key uses a witnessed transaction ID.
+///
+/// [`the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it`] drives a V4
+/// transaction, whose legacy ID hashes the whole serialization. A V5 transaction is the other
+/// half of the key: its txid deliberately excludes proofs and signatures, and only the ZIP 244
+/// authorizing-data digest in its `WtxId` covers them. So this is the end-to-end check that the
+/// digest is really in the key — the shape of CVE-2026-34377, where a txid-keyed cache would
+/// answer a corrupted twin with the valid transaction's result.
+///
+/// Block requests only: no V5 Sapling transaction in the test vectors pays the conventional fee,
+/// so the mempool would reject this one on ZIP-317 policy before ever reaching verification. The
+/// mempool-to-block path is covered by the V4 test; what is specific here is the key.
+#[test]
+fn the_sapling_cache_distinguishes_a_v5_transaction_from_its_corrupted_twin() {
+    let _init_guard = zakura_test::init();
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let (mut verifier, _state) = cache_test_verifier();
+
+        let (network_upgrade, tx) = cacheable_mainnet_v5_sapling_transaction();
+        let height = NetworkUpgrade::Nu5
+            .activation_height(&Network::Mainnet)
+            .expect("NU5 has an activation height on Mainnet");
+        let height = tx
+            .expiry_height()
+            .filter(|expiry| NetworkUpgrade::current(&Network::Mainnet, *expiry) == network_upgrade)
+            .unwrap_or(height);
+
+        let item = sapling_item(&tx, network_upgrade);
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            0,
+            "this transaction's bundle must not have been verified before this test"
+        );
+
+        verify(&mut verifier, block_request(&tx, height))
+            .await
+            .expect("a real mainnet V5 Sapling transaction must verify in a block");
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            1,
+            "the first verification must reach the inner Sapling verifier"
+        );
+
+        verify(&mut verifier, block_request(&tx, height))
+            .await
+            .expect("the same transaction must verify again");
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            1,
+            "the second verification must be answered from the cache"
+        );
+
+        // Corrupt only authorizing data, which leaves the V5 txid untouched.
+        let mut corrupted = tx.clone();
+        let sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } =
+            &mut v5_sapling_shielded_data_for_mutation(&mut corrupted).transfers
+        else {
+            panic!("the transaction was selected for having Sapling spends")
+        };
+        let mut spends_vec = spends.as_slice().to_vec();
+        let mut spend_auth_sig = <[u8; 64]>::from(spends_vec[0].spend_auth_sig);
+        spend_auth_sig[0] ^= 1;
+        spends_vec[0].spend_auth_sig = spend_auth_sig.into();
+        *spends =
+            AtLeastOne::from_vec(spends_vec).expect("replacing a field keeps at least one spend");
+
+        assert_eq!(
+            tx.hash(),
+            corrupted.hash(),
+            "the corruption must leave the V5 txid unchanged, or this test proves nothing"
+        );
+
+        let corrupted_item = sapling_item(&corrupted, network_upgrade);
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&corrupted_item),
+            0,
+            "the corrupted twin must get a different cache key"
+        );
+
+        let error = verify(&mut verifier, block_request(&corrupted, height))
+            .await
+            .expect_err(
+                "a transaction with a corrupted spend authorization signature must be rejected",
+            );
+        assert_eq!(
+            error,
+            TransactionError::SaplingVerificationFailed,
+            "the corrupted twin must fail Sapling verification"
+        );
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&corrupted_item),
+            1,
+            "the corrupted twin must reach the inner Sapling verifier"
+        );
+    });
+}
+
+/// Returns `tx`'s V5 Sapling shielded data for mutation.
+fn v5_sapling_shielded_data_for_mutation(
+    tx: &mut Transaction,
+) -> &mut sapling::ShieldedData<sapling::SharedAnchor> {
+    let Transaction::V5 {
+        sapling_shielded_data: Some(shielded_data),
+        ..
+    } = tx
+    else {
+        panic!("the transaction was selected for being a V5 transaction with Sapling data")
+    };
+
+    shielded_data
 }

@@ -53,6 +53,7 @@ PUBLISH_ORDER=(
   zakura-tower-fallback
   zakura-jsonl-trace
   zakura-chain
+  zakura-header-chain
   zakura-tower-batch-control
   zakura-node-services
   zakura-script
@@ -74,8 +75,15 @@ for crate in "${PUBLISH_ORDER[@]}"; do
 done
 
 echo "Packaging ${#PUBLISH_ORDER[@]} crates..."
+package_log="$(mktemp)"
+trap 'rm -f "$package_log"' EXIT
 # shellcheck disable=SC2086 # VERIFY_FLAG is intentionally empty or one flag
-cargo package --locked $VERIFY_FLAG "${package_args[@]}"
+cargo package --locked $VERIFY_FLAG "${package_args[@]}" 2>&1 | tee "$package_log"
+
+if grep -Fq "is a reserved Windows filename" "$package_log"; then
+  echo "ERROR: a crate package contains a reserved Windows filename." >&2
+  exit 1
+fi
 
 # crates.io rejects archives over 10 MiB.
 max_bytes=$((10 * 1024 * 1024))

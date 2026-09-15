@@ -102,6 +102,22 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
         self.assertEqual(affected, [])
 
+    def test_registry_patch_selects_every_publishable_library(self):
+        packages = [
+            self.package("zakura-rpc"),
+            self.package("zakura-network"),
+            self.package("private", publish=[]),
+            self.package("zakura"),
+            self.package("zakura-header-chain"),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=[".github/workflows/scripts/patch_registry_for_semver.sh"],
+        )
+
+        self.assertEqual(affected, ["zakura-network", "zakura-rpc"])
+
     def test_package_manifest_selects_that_package(self):
         registry_dependency = {
             "name": "registry-package",
@@ -118,6 +134,38 @@ class AffectedSemverPackagesTest(unittest.TestCase):
         )
 
         self.assertEqual(affected, ["base"])
+
+    def test_excludes_publishable_crate_without_registry_baseline(self):
+        packages = [
+            self.package("zakura-header-chain"),
+            self.package(
+                "dependent",
+                dependencies=[self.dependency("zakura-header-chain")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["zakura-header-chain/src/lib.rs"],
+        )
+
+        self.assertEqual(affected, ["dependent"])
+
+    def test_excludes_zakura_node_package_from_semver_enforcement(self):
+        packages = [
+            self.package("library"),
+            self.package(
+                "zakura",
+                dependencies=[self.dependency("library")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["library/src/lib.rs", "zakura/src/main.rs"],
+        )
+
+        self.assertEqual(affected, ["library"])
 
 
 if __name__ == "__main__":

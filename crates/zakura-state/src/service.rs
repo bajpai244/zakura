@@ -15,15 +15,18 @@
 //!   chain tip changes.
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map, BTreeMap, HashMap},
     future::Future,
+    ops::Bound,
+    path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use futures::future::FutureExt;
+use indexmap::IndexMap;
 use tokio::sync::oneshot;
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
@@ -37,13 +40,13 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
-    subtree::NoteCommitmentSubtreeIndex,
+    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
 use crate::{
     constants::{
-        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
-        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
+        MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
+        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
     request::TimedSpan,
@@ -51,19 +54,25 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        finalized_state::{DatabaseWriterMetadata, FinalizedState, ZakuraDb},
+        check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
+        finalized_state::{
+            header_chain::{HeaderChainStore, HeaderChainStoreError},
+            DatabaseWriterMetadata, FinalizedState, ZakuraDb,
+        },
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
         queued_blocks::QueuedBlocks,
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError,
+    BlockAdmission, BlockCommitmentData, BoxError, CheckpointVerifiedBlock,
+    CommitSemanticallyVerifiedError, Config, HashOrHeight, HistoricalTreeUnavailable, KnownBlock,
+    PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
 pub mod block_iter;
+mod block_range;
 pub mod chain_tip;
 pub mod watch_receiver;
 
@@ -83,6 +92,7 @@ pub mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+pub use block_range::OwnedBlockRange;
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
 use write::NonFinalizedWriteMessage;
 pub use write::{VctRootRepairState, VctRootRepairStatus};
@@ -90,6 +100,17 @@ pub use write::{VctRootRepairState, VctRootRepairStatus};
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
 
 pub use self::traits::{ReadState, State};
+
+fn finalized_chain_tip(db: &ZakuraDb) -> Option<ChainTipBlock> {
+    let (height, hash) = db.tip()?;
+    if let Some(block) = db.tip_block() {
+        return Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(block)));
+    }
+
+    let header = db.block_header(height.into())?;
+    (header.hash() == hash)
+        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header))
+}
 
 /// A read-write service for Zebra's cached blockchain state.
 ///
@@ -162,6 +183,32 @@ pub(crate) struct StateService {
     /// Hashes of blocks below the finalized tip height are periodically pruned.
     non_finalized_block_write_sent_hashes: SentHashes,
 
+    /// Parents whose one optimistic relay slot a mined candidate already reserved, keyed by
+    /// parent hash and holding the height of the candidate that took the slot.
+    ///
+    /// A reservation only matters while its parent is still the best tip, so entries are pruned
+    /// once the reserving height is finalized, alongside the other per-block maps.
+    optimistic_relay_reserved_parents: HashMap<block::Hash, block::Height>,
+
+    /// Capacity held until the writer publishes each contextual or reconsideration result.
+    non_finalized_write_slots: Arc<tokio::sync::Semaphore>,
+
+    /// Parents targeted by operator invalidation cannot authorize optimistic relay, counted by
+    /// how many invalidations are outstanding for each hash.
+    ///
+    /// `send_invalidate_block` increments a hash before the writer sees the invalidation, so a
+    /// candidate queued afterwards cannot advertise against a parent that is about to disappear.
+    /// A confirmed reconsideration decrements it, which releases a hash that is valid again while
+    /// leaving a later invalidation of the same hash in force.
+    ///
+    /// This is shared because the confirmation arrives in the detached `ReconsiderBlock` response
+    /// future, which has no access to the service.
+    optimistic_relay_invalidated_parents: Arc<Mutex<HashMap<block::Hash, usize>>>,
+
+    /// Recent local write failures used to complete descendants that arrive after the failure.
+    non_finalized_failed_ancestors:
+        IndexMap<block::Hash, (block::Hash, write::NonFinalizedWriteFailureKind)>,
+
     /// If an invalid block is sent on `finalized_block_write_sender`
     /// or `non_finalized_block_write_sender`,
     /// this channel gets the [`block::Hash`] of the valid tip.
@@ -176,7 +223,8 @@ pub(crate) struct StateService {
     /// Without this, a rejected same-hash block locks out a later honest
     /// re-delivery of a block at the same hash as a "duplicate" until restart
     /// or reorg.
-    non_finalized_rejected_receiver: tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+    non_finalized_rejected_receiver:
+        tokio::sync::mpsc::UnboundedReceiver<write::NonFinalizedWriteFailure>,
 
     // Pending UTXO Request Tracking
     //
@@ -221,6 +269,9 @@ pub struct ReadStateService {
     /// The configured Zcash network.
     network: Network,
 
+    /// Highest height where checkpoint sync can require VCT repair.
+    max_checkpoint_height: block::Height,
+
     // Shared Concurrently Readable State
     //
     /// A watch channel with a cached copy of the [`NonFinalizedState`].
@@ -242,21 +293,51 @@ pub struct ReadStateService {
     /// once the queues have received all their parent blocks.
     ///
     /// Used to check for panics when writing blocks.
-    block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
+    block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
+    /// Shared fail-closed attachment result, visible to every clone without joining the worker.
+    block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
 
-    /// Watch channel publishing durable completed-checkpoint advances.
-    highest_completed_checkpoint_receiver:
-        tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>>,
+    /// Note commitment frontiers this service has derived and root-checked for heights in a
+    /// verified-commitment-trees fast-synced database's absent band.
+    ///
+    /// Shared across clones so a wallet's sequential scan anchors each request on the previous
+    /// one. Empty, and never written, on a node that does not derive
+    /// ([`Config::derive_historical_trees`]) or has no frontier grid configured.
+    historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
 
-    /// Keeps the completed-checkpoint watch open in read-only services.
-    _highest_completed_checkpoint_sender:
-        Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+    /// Published completed subtree roots for heights below the last checkpoint.
+    ///
+    /// `None` on networks without an embedded artifact, in which case `z_getsubtreesbyindex`
+    /// keeps reporting the absent band rather than serving unchecked data.
+    historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
-    /// Compact durable header-root authentication progress.
-    header_root_auth_receiver:
-        tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>>,
+
+    /// Committed header-engine snapshots, absent until the semantic handoff audit succeeds.
+    header_chain_snapshot_receiver:
+        tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+
+    /// Atomic committed header views used by body-work coordinators.
+    header_chain_view_receiver:
+        tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+
+    /// Explicit durable header-runtime attachment and readiness lifecycle.
+    header_runtime_status_receiver:
+        tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+
+    /// Coherent durable header-engine reader, absent until semantic handoff.
+    header_chain_reader_receiver:
+        tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderChainSubscriptions {
+    snapshots: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    views: tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+    runtime_status:
+        tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+    reader: tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
 }
 
 impl Drop for StateService {
@@ -298,8 +379,8 @@ impl Drop for ReadStateService {
                 // - drops the database, which cleans up any database tasks correctly.
                 self.db.shutdown(true);
 
-                // We are the last state with a reference to this thread, so we can
-                // wait until the block write task finishes, then check for panics (blocking).
+                // This state owns the last reference to the thread.
+                // The state can wait for the block write task and then check for panics.
                 // (We'd also like to abort the thread, but std::thread::JoinHandle can't do that.)
 
                 // This log is verbose during tests.
@@ -309,10 +390,17 @@ impl Drop for ReadStateService {
                 debug!("waiting for the block write task to finish");
 
                 // TODO: move this into a check_for_panics() method
-                if let Err(thread_panic) = block_write_task_handle.join() {
-                    std::panic::resume_unwind(thread_panic);
-                } else {
-                    debug!("shutting down the state because the block write task has finished");
+                match block_write_task_handle.join() {
+                    Err(thread_panic) => std::panic::resume_unwind(thread_panic),
+                    Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
+                        tracing::error!(?error, "block write task stopped during header attachment")
+                    }
+                    Ok(write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)) => {
+                        tracing::error!(?error, "block write task stopped after a runtime failure")
+                    }
+                    Ok(write::BlockWriteTaskExit::Completed) => {
+                        debug!("shutting down the state because the block write task has finished")
+                    }
                 }
             }
         } else {
@@ -326,6 +414,8 @@ impl Drop for ReadStateService {
 
 impl StateService {
     const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+    // The 1,000-block reorg bound fits every supported usize target.
+    const FAILED_ANCESTOR_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
     /// Creates a new state service for the state `config` and `network`.
     ///
@@ -334,12 +424,17 @@ impl StateService {
     ///
     /// Returns the read-write and read-only state services,
     /// and read-only watch channels for its best chain tip.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its
+    /// frontier artifact cannot be loaded.
     pub async fn new(
         config: Config,
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
         Self::new_with_database_writer_metadata(
             config,
             network,
@@ -358,8 +453,8 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
         database_writer_metadata: DatabaseWriterMetadata,
-    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
-        let (finalized_state, finalized_tip, timer) = {
+    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+        let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
             tokio::task::spawn_blocking(move || {
@@ -387,12 +482,19 @@ impl StateService {
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
-                let finalized_tip = finalized_state.db.tip_block();
+                let finalized_tip = finalized_chain_tip(&finalized_state.db);
+                let historical_trees = load_historical_frontier_artifact(
+                    &network,
+                    &config,
+                    finalized_state.db.vct_synced_below().is_some(),
+                )?;
+                let historical_trees =
+                    historical_trees.discard_if_before_vct_handoff(&config, &finalized_state.db);
 
-                (finalized_state, finalized_tip, timer)
+                Ok::<_, StateInitError>((finalized_state, finalized_tip, historical_trees, timer))
             })
             .await
-            .expect("failed to join blocking task")
+            .expect("failed to join blocking task")?
         };
 
         // # Correctness
@@ -407,7 +509,7 @@ impl StateService {
         // otherwise, unless checkpoint sync is disabled in the zakura-consensus configuration,
         // Zebra will be unable to commit checkpoint verified blocks, and its chain sync will stall.
         let is_finalized_tip_past_max_checkpoint = if let Some(tip) = &finalized_tip {
-            tip.coinbase_height().expect("valid block must have height") >= max_checkpoint_height
+            tip.height >= max_checkpoint_height
         } else {
             false
         };
@@ -427,9 +529,9 @@ impl StateService {
         let initial_tip = non_finalized_state
             .best_tip_block()
             .map(|cv_block| cv_block.block.clone())
-            .or(finalized_tip)
             .map(CheckpointVerifiedBlock::from)
-            .map(ChainTipBlock::from);
+            .map(ChainTipBlock::from)
+            .or(finalized_tip);
 
         tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
 
@@ -439,13 +541,33 @@ impl StateService {
         let finalized_state_for_writing = finalized_state.clone();
         let should_use_finalized_block_write_sender = non_finalized_state.is_chain_set_empty();
         let sync_backup_dir_path = backup_dir_path.filter(|_| skip_backup_task);
+        let (header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+            tokio::sync::watch::channel(None);
+        let (header_chain_view_sender, header_chain_view_receiver) =
+            tokio::sync::watch::channel(None);
+        let durable_header_runtime_exists =
+            HeaderChainStore::new(finalized_state.db.header_chain_disk_db())
+                .is_initialized()
+                .expect("the opened state database can classify its durable header runtime");
+        let (header_runtime_status_sender, header_runtime_status_receiver) =
+            tokio::sync::watch::channel(
+                zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
+                    epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+                    reason: if durable_header_runtime_exists {
+                        zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending
+                    } else {
+                        zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AwaitingSemanticHandoff
+                    },
+                },
+            );
+        let (header_chain_reader_sender, header_chain_reader_receiver) =
+            tokio::sync::watch::channel(None);
         let (
             block_write_sender,
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
-            highest_completed_checkpoint_receiver,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            block_write_failure,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
             finalized_state_for_writing,
@@ -454,17 +576,29 @@ impl StateService {
             non_finalized_state_sender,
             should_use_finalized_block_write_sender,
             sync_backup_dir_path,
+            write::HeaderChainObservers::new(
+                header_chain_snapshot_sender,
+                header_chain_view_sender,
+                header_chain_reader_sender,
+                header_runtime_status_sender,
+            ),
         );
 
         let read_service = ReadStateService::new(
             &finalized_state,
             block_write_task,
+            block_write_failure,
             non_finalized_state_receiver,
-            highest_completed_checkpoint_receiver,
-            None,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
-        );
+            HeaderChainSubscriptions {
+                snapshots: header_chain_snapshot_receiver,
+                views: header_chain_view_receiver,
+                runtime_status: header_runtime_status_receiver,
+                reader: header_chain_reader_receiver,
+            },
+            historical_trees,
+        )
+        .with_max_checkpoint_height(max_checkpoint_height);
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
             - HeightDiff::try_from(checkpoint_verify_concurrency_limit)
@@ -488,6 +622,12 @@ impl StateService {
             block_write_sender,
             finalized_block_write_last_sent_hash,
             non_finalized_block_write_sent_hashes,
+            optimistic_relay_reserved_parents: HashMap::new(),
+            non_finalized_write_slots: Arc::new(tokio::sync::Semaphore::new(
+                queued_blocks::MAX_QUEUED_BLOCKS,
+            )),
+            optimistic_relay_invalidated_parents: Arc::new(Mutex::new(HashMap::new())),
+            non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             pending_utxos,
@@ -544,7 +684,7 @@ impl StateService {
             }
         });
 
-        (state, read_service, latest_chain_tip, chain_tip_change)
+        Ok((state, read_service, latest_chain_tip, chain_tip_change))
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -686,8 +826,7 @@ impl StateService {
         }
     }
 
-    /// Drains every hash queued on `non_finalized_rejected_receiver` and
-    /// removes it from `non_finalized_block_write_sent_hashes`.
+    /// Drain failed writes, clear their sent hashes, and complete queued descendants.
     ///
     /// This closes the lockout window where a rejected block keeps its hash
     /// recorded as "sent", so a subsequent honest re-delivery of a block at
@@ -703,9 +842,7 @@ impl StateService {
 
         loop {
             match self.non_finalized_rejected_receiver.try_recv() {
-                Ok(hash) => {
-                    self.non_finalized_block_write_sent_hashes.remove(&hash);
-                }
+                Ok(failure) => self.handle_non_finalized_write_failure(failure),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     info!(
@@ -715,6 +852,57 @@ impl StateService {
                     break;
                 }
             }
+        }
+    }
+
+    fn poll_non_finalized_write_failures(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some(failure)) =
+            Pin::new(&mut self.non_finalized_rejected_receiver).poll_recv(cx)
+        {
+            self.handle_non_finalized_write_failure(failure);
+        }
+    }
+
+    fn handle_non_finalized_write_failure(&mut self, failure: write::NonFinalizedWriteFailure) {
+        self.non_finalized_block_write_sent_hashes
+            .remove(&failure.hash);
+        let error = Self::failed_ancestor_error(failure.hash, failure.kind);
+        let descendants = self
+            .non_finalized_state_queued_blocks
+            .fail_descendants(failure.hash, error.into());
+        for descendant in descendants {
+            self.remember_failed_ancestor(descendant, failure.hash, failure.kind);
+        }
+        self.remember_failed_ancestor(failure.hash, failure.hash, failure.kind);
+    }
+
+    fn failed_ancestor_error(
+        ancestor: block::Hash,
+        kind: write::NonFinalizedWriteFailureKind,
+    ) -> CommitBlockError {
+        match kind {
+            write::NonFinalizedWriteFailureKind::Invalid => CommitBlockError::ValidateContextError(
+                Box::new(ValidateContextError::InvalidAncestorBlock(ancestor)),
+            ),
+            write::NonFinalizedWriteFailureKind::Retryable => CommitBlockError::HeaderChainError {
+                error: format!(
+                    "ancestor {ancestor} did not commit because of a local state write failure"
+                ),
+            },
+        }
+    }
+
+    fn remember_failed_ancestor(
+        &mut self,
+        hash: block::Hash,
+        ancestor: block::Hash,
+        kind: write::NonFinalizedWriteFailureKind,
+    ) {
+        self.non_finalized_failed_ancestors.shift_remove(&hash);
+        self.non_finalized_failed_ancestors
+            .insert(hash, (ancestor, kind));
+        while self.non_finalized_failed_ancestors.len() > Self::FAILED_ANCESTOR_LIMIT {
+            self.non_finalized_failed_ancestors.shift_remove_index(0);
         }
     }
 
@@ -756,7 +944,11 @@ impl StateService {
         queued: QueuedSemanticallyVerified,
         error: impl Into<CommitSemanticallyVerifiedError>,
     ) {
-        let (finalized, rsp_tx) = queued;
+        let (finalized, rsp_tx, admission) = queued;
+
+        if let Some(admission) = admission {
+            admission.reject();
+        }
 
         // The block sender might have already given up on this block,
         // so ignore any channel send errors.
@@ -841,9 +1033,11 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
+        admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
+        let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
         // the SentHashes membership below. Without this, a rejected same-hash
@@ -851,10 +1045,30 @@ impl StateService {
         // same hash as a false "duplicate".
         self.drain_non_finalized_rejected_hashes();
 
+        if let Some((ancestor, kind)) = self
+            .non_finalized_failed_ancestors
+            .get(&parent_hash)
+            .copied()
+        {
+            if self.can_fork_chain_at(&parent_hash) {
+                self.non_finalized_failed_ancestors
+                    .shift_remove(&parent_hash);
+            } else {
+                let child_hash = semantically_verified.hash;
+                self.remember_failed_ancestor(child_hash, ancestor, kind);
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(Self::failed_ancestor_error(ancestor, kind).into()));
+                return rsp_rx;
+            }
+        }
+
         if self
             .non_finalized_block_write_sent_hashes
             .contains(&semantically_verified.hash)
         {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
                 Some(semantically_verified.hash.into()),
@@ -869,6 +1083,9 @@ impl StateService {
             .db
             .contains_height(semantically_verified.height)
         {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
                 Some(semantically_verified.height.into()),
@@ -878,26 +1095,60 @@ impl StateService {
             return rsp_rx;
         }
 
+        if let Some(admission) = &admission {
+            if !self.drains_the_non_finalized_queue_now(&parent_hash) {
+                admission.reject();
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(CommitBlockError::MissingMinedParent.into()));
+                return rsp_rx;
+            }
+        }
+
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx)) = self
+        let rsp_rx = if self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
+            .is_some()
         {
             tracing::debug!("replacing older queued request with new request");
-            let (mut rsp_tx, rsp_rx) = oneshot::channel();
-            std::mem::swap(old_rsp_tx, &mut rsp_tx);
-            let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(semantically_verified.hash.into()),
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let (_, old_rsp_tx, old_admission) = self.non_finalized_state_queued_blocks.replace(
+                semantically_verified.hash,
+                (semantically_verified, rsp_tx, admission),
+            );
+            if let Some(old_admission) = old_admission {
+                old_admission.reject();
+            }
+            let _ = old_rsp_tx.send(Err(CommitBlockError::new_duplicate(
+                Some(hash.into()),
                 KnownBlock::Queue,
             )
             .into()));
             rsp_rx
+        } else if self.non_finalized_state_queued_blocks.is_full()
+            && !self.drains_the_non_finalized_queue_now(&parent_hash)
+        {
+            // The bound only applies to blocks that must wait for a parent this state does not
+            // have. A block that this call goes on to drain is admitted even when the queue is
+            // full, because the drain walks forward from `parent_hash`: a block the queue refused
+            // is never the parent that releases its own queued descendants, and nothing else
+            // empties the queue while the chain is stalled, so rejecting it here would strand
+            // them permanently.
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let _ = rsp_tx.send(Err(CommitBlockError::QueueFull.into()));
+            rsp_rx
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            self.non_finalized_state_queued_blocks
-                .queue((semantically_verified, rsp_tx));
+            self.non_finalized_state_queued_blocks.queue((
+                semantically_verified,
+                rsp_tx,
+                admission,
+            ));
             rsp_rx
         };
 
@@ -923,9 +1174,39 @@ impl StateService {
 
             self.non_finalized_block_write_sent_hashes
                 .prune_by_height(finalized_tip_height);
+
+            self.prune_optimistic_relay_reservations(finalized_tip_height);
         }
 
         rsp_rx
+    }
+
+    /// Returns whether queueing a block with this parent lets the rest of this call drain it
+    /// again, so admitting it past the queue bound overshoots by one entry and no more.
+    ///
+    /// Only a block the queue releases immediately may bypass the bound. Anything that stays
+    /// queued has to be rejected, or a caller could grow the queue without limit by choosing
+    /// parents that pass a liveness check but that nothing goes on to drain.
+    fn drains_the_non_finalized_queue_now(&self, parent_hash: &block::Hash) -> bool {
+        if self.block_write_sender.finalized.is_some() {
+            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
+            // does not run for this parent and only the handoff empties the queue. The handoff
+            // needs the last hash we sent to be durably written, and it needs a queued child of
+            // that same hash. A block meeting both is drained by `try_handoff_to_non_finalized_write`
+            // below, and it fires at most once in the life of the node.
+            //
+            // The durable finalized tip is not enough on its own. It lags the last hash we sent
+            // for as long as checkpoint writes are in flight, and a block naming the lagging tip
+            // neither completes the handoff condition nor gets reached by the eventual handoff
+            // traversal, which walks forward from the last hash we sent.
+            return self.read_service.db.finalized_tip_hash()
+                == self.finalized_block_write_last_sent_hash
+                && *parent_hash == self.finalized_block_write_last_sent_hash;
+        }
+
+        // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
+        // later in this same call.
+        self.can_fork_chain_at(parent_hash)
     }
 
     /// Returns `true` if `hash` is a valid previous block hash for new non-finalized blocks.
@@ -960,13 +1241,53 @@ impl StateService {
                     .dequeue_children(parent_hash);
 
                 for queued_child in queued_children {
-                    let (SemanticallyVerifiedBlock { hash, .. }, _) = queued_child;
+                    let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned()
+                    else {
+                        Self::send_semantically_verified_block_error(
+                            queued_child,
+                            CommitBlockError::QueueFull,
+                        );
+                        continue;
+                    };
+                    let (SemanticallyVerifiedBlock { hash, .. }, _, _) = &queued_child;
+                    let hash = *hash;
 
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
-                    let send_result = non_finalized_block_write_sender.send(queued_child.into());
+                    let admission = queued_child.2.clone();
+                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let optimistic_relay_still_authorized = admission
+                        .as_ref()
+                        .is_some_and(BlockAdmission::optimistic_relay_authorized)
+                        && self.non_finalized_write_slots.available_permits()
+                            == queued_blocks::MAX_QUEUED_BLOCKS - 1
+                        && self
+                            .best_tip()
+                            .is_some_and(|(_, tip_hash)| tip_hash == candidate_parent)
+                        && (self
+                            .non_finalized_block_write_sent_hashes
+                            .contains(&candidate_parent)
+                            || self.read_service.db.finalized_tip_hash() == candidate_parent)
+                        && !self
+                            .optimistic_relay_reserved_parents
+                            .contains_key(&candidate_parent)
+                        && !self.optimistic_relay_is_blocked_by_invalidation();
+                    if optimistic_relay_still_authorized {
+                        // Only the first server candidate can reserve early relay for this parent.
+                        // Siblings receive the normal committed relay after contextual validation.
+                        self.optimistic_relay_reserved_parents
+                            .insert(candidate_parent, queued_child.0.height);
+                    }
+                    let send_result =
+                        non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
+                            queued: queued_child,
+                            queued_at: Instant::now(),
+                            write_slot,
+                        });
 
-                    if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
+                    if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
+                        send_result
+                    {
                         // If Zebra is shutting down, drop blocks and return an error.
                         Self::send_semantically_verified_block_error(
                             queued,
@@ -977,6 +1298,10 @@ impl StateService {
 
                         return;
                     };
+
+                    if let Some(admission) = admission {
+                        admission.admit(optimistic_relay_still_authorized);
+                    }
 
                     new_parents.push(hash);
                 }
@@ -991,8 +1316,48 @@ impl StateService {
         self.read_service.best_tip()
     }
 
+    /// Drops optimistic relay reservations that can never be consulted again.
+    ///
+    /// A reservation is only read while its parent is the best tip. Once the candidate that took
+    /// the slot is finalized its parent is buried, so the entry is dead and would otherwise be
+    /// retained for the lifetime of the process.
+    fn prune_optimistic_relay_reservations(&mut self, finalized_tip_height: block::Height) {
+        self.optimistic_relay_reserved_parents
+            .retain(|_, height| *height > finalized_tip_height);
+    }
+
+    /// Any outstanding invalidation can remove an ancestor of the published tip.
+    fn optimistic_relay_is_blocked_by_invalidation(&self) -> bool {
+        !self
+            .optimistic_relay_invalidated_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Releases one outstanding invalidation of `hash`, after the writer confirmed that it was
+    /// reconsidered.
+    ///
+    /// Counting rather than clearing keeps an invalidation issued after this reconsideration was
+    /// requested in force, because that later invalidation raised the count again.
+    fn release_optimistic_relay_invalidation(
+        invalidated_parents: &Mutex<HashMap<block::Hash, usize>>,
+        hash: block::Hash,
+    ) {
+        let mut invalidated_parents = invalidated_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hash_map::Entry::Occupied(mut entry) = invalidated_parents.entry(hash) else {
+            return;
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
+
     fn send_invalidate_block(
-        &self,
+        &mut self,
         hash: block::Hash,
     ) -> oneshot::Receiver<Result<block::Hash, InvalidateError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
@@ -1001,6 +1366,15 @@ impl StateService {
             let _ = rsp_tx.send(Err(InvalidateError::ProcessingCheckpointedBlocks));
             return rsp_rx;
         };
+
+        // Block optimistic relay before the writer processes the invalidation. The write channel
+        // preserves request order, so a later candidate cannot advertise using this stale parent.
+        *self
+            .optimistic_relay_invalidated_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(hash)
+            .or_default() += 1;
 
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
             sender.send(NonFinalizedWriteMessage::Invalidate { hash, rsp_tx })
@@ -1026,8 +1400,16 @@ impl StateService {
             return rsp_rx;
         };
 
+        let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned() else {
+            let _ = rsp_tx.send(Err(ReconsiderError::ReconsiderSendFailed));
+            return rsp_rx;
+        };
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Reconsider { hash, rsp_tx })
+            sender.send(NonFinalizedWriteMessage::Reconsider {
+                hash,
+                rsp_tx,
+                write_slot,
+            })
         {
             let NonFinalizedWriteMessage::Reconsider { rsp_tx, .. } = error else {
                 unreachable!("should return the same Reconsider message could not be sent");
@@ -1039,80 +1421,107 @@ impl StateService {
         rsp_rx
     }
 
-    fn send_header_range(
+    fn send_header_chain_insert(
         &self,
-        anchor: block::Hash,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
-    ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
+        prepared: crate::PreparedHeaderChainInsert,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
-
         let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(CommitHeaderRangeError::SendCommitRequestFailed));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
             return rsp_rx;
         };
-
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::CommitHeaderRange {
-                anchor,
-                headers,
-                body_sizes,
-                tree_aux_roots,
-                rsp_tx,
-            })
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::ApplyHeaderChainInsert { prepared, rsp_tx })
         {
-            let NonFinalizedWriteMessage::CommitHeaderRange { rsp_tx, .. } = error else {
-                unreachable!("should return the same CommitHeaderRange message could not be sent");
+            let NonFinalizedWriteMessage::ApplyHeaderChainInsert { rsp_tx, .. } = message else {
+                unreachable!("the failed send returns the same header insertion message");
             };
-
-            let _ = rsp_tx.send(Err(CommitHeaderRangeError::SendCommitRequestFailed));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
         }
-
         rsp_rx
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn send_authenticate_header_roots(
+    fn send_header_chain_body_unavailable(
         &self,
-        expected_state: finalized_state::HeaderRootAuthState,
-        anchor: block::Hash,
-        start: block::Height,
-        headers: Vec<Arc<block::Header>>,
-        roots: Vec<BlockCommitmentRoots>,
-    ) -> oneshot::Receiver<
-        Result<
-            finalized_state::AuthenticatedHeaderRoots,
-            finalized_state::AuthenticateHeaderRootsError,
-        >,
-    > {
+        prepared: crate::PreparedHeaderChainBodyEvidence,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
         let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(
-                finalized_state::AuthenticateHeaderRootsError::Frontier(
-                    finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
-                ),
-            ));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
             return rsp_rx;
         };
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::AuthenticateHeaderRoots {
-                expected_state,
-                anchor,
-                start,
-                headers,
-                roots,
-                rsp_tx,
-            })
+        if let Err(tokio::sync::mpsc::error::SendError(message)) = sender
+            .send(NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { prepared, rsp_tx })
         {
-            let NonFinalizedWriteMessage::AuthenticateHeaderRoots { rsp_tx, .. } = error else {
-                unreachable!("send returned the same authentication message");
+            let NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same body-availability message");
             };
-            let _ = rsp_tx.send(Err(
-                finalized_state::AuthenticateHeaderRootsError::Frontier(
-                    finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
-                ),
-            ));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
+    fn send_header_chain_body_invalid(
+        &self,
+        prepared: crate::PreparedHeaderChainBodyEvidence,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid { prepared, rsp_tx })
+        {
+            let NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same invalid-body message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
+    fn send_header_chain_body_availability_restart(
+        &self,
+        prepared: crate::PreparedHeaderChainBodyEvidence,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) = sender
+            .send(NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability { prepared, rsp_tx })
+        {
+            let NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability { rsp_tx, .. } =
+                message
+            else {
+                unreachable!("the failed send returns the same body-restart message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
+    fn send_header_chain_body_availability_retry(
+        &self,
+        prepared: crate::PreparedHeaderChainBodyEvidence,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) = sender
+            .send(NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability { prepared, rsp_tx })
+        {
+            let NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same operator-retry message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
         }
         rsp_rx
     }
@@ -1141,30 +1550,32 @@ impl ReadStateService {
     ///
     /// Returns the newly created service,
     /// and a watch channel for updating the shared recent non-finalized chain.
-    pub(crate) fn new(
+    fn new(
         finalized_state: &FinalizedState,
-        block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
+        block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
+        block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
-        highest_completed_checkpoint_receiver: tokio::sync::watch::Receiver<
-            Option<finalized_state::HighestCompletedCheckpoint>,
-        >,
-        highest_completed_checkpoint_sender: Option<
-            tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>,
-        >,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
-        header_root_auth_receiver: tokio::sync::watch::Receiver<
-            Option<finalized_state::HeaderRootAuthState>,
-        >,
+        header_chain: HeaderChainSubscriptions,
+        historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
     ) -> Self {
+        let historical_subtrees =
+            finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
+
         let read_service = Self {
             network: finalized_state.network(),
+            max_checkpoint_height: block::Height::MAX,
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
-            highest_completed_checkpoint_receiver,
-            _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
+            block_write_failure,
+            historical_trees,
+            historical_subtrees,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            header_chain_snapshot_receiver: header_chain.snapshots,
+            header_chain_view_receiver: header_chain.views,
+            header_runtime_status_receiver: header_chain.runtime_status,
+            header_chain_reader_receiver: header_chain.reader,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1172,9 +1583,76 @@ impl ReadStateService {
         read_service
     }
 
+    /// Bound VCT repair reads at the final checkpoint.
+    fn with_max_checkpoint_height(mut self, max_checkpoint_height: block::Height) -> Self {
+        self.max_checkpoint_height = max_checkpoint_height;
+        self
+    }
+
     /// Return the tip of the current best chain.
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
         read::best_tip(&self.latest_non_finalized_state(), &self.db)
+    }
+
+    /// Returns the embedded subtree artifact and this database's fast-sync marker when the
+    /// artifact can fill the skip band that marker describes.
+    ///
+    /// The marker is the height this database originally fast-synced to; it does not move when
+    /// later releases raise the last checkpoint. A newer artifact is still eligible because it is
+    /// append-only and therefore still contains every root skipped at that marker. An older
+    /// artifact is not, because it cannot cover the extra skipped indexes.
+    ///
+    /// Serving clips published records to the marker, so the extra suffix of a newer artifact
+    /// never answers for heights this node synced itself.
+    ///
+    /// This check is made when serving rather than at construction because the durable last
+    /// checkpoint marker can be written after the read service starts.
+    fn historical_subtrees_at_last_checkpoint(
+        &self,
+    ) -> Option<(&finalized_state::SubtreeArtifact, block::Height)> {
+        let artifact = self.historical_subtrees.as_deref()?;
+        let vct_applied_below = self.db.vct_synced_below()?;
+
+        (artifact.last_checkpoint >= vct_applied_below).then_some((artifact, vct_applied_below))
+    }
+
+    /// Whether a published frontier grid is loaded and covers the durable VCT handoff.
+    ///
+    /// A marker written after construction can make the loaded grid too old. The first request
+    /// that observes that transition reports it and discards the grid, so later requests see the
+    /// absent band as unavailable without repeatedly checking the stale artifact.
+    fn has_usable_historical_frontier_grid(&self) -> bool {
+        let mut historical_trees = self
+            .historical_trees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let artifact_checkpoint = historical_trees.last_checkpoint();
+        if let Some((artifact_checkpoint, vct_handoff)) =
+            frontier_grid_ends_before_vct_handoff(artifact_checkpoint, self.db.vct_synced_below())
+        {
+            tracing::warn!(
+                ?artifact_checkpoint,
+                ?vct_handoff,
+                "discarding historical frontier artifact that does not cover the database's VCT \
+                 handoff"
+            );
+            metrics::counter!("state.historical_tree.artifact_before_vct_handoff").increment(1);
+            *historical_trees = read::HistoricalTreeCache::default();
+            return false;
+        }
+
+        artifact_checkpoint.is_some()
+    }
+
+    /// Subscribe to the lowest height at and above which block bodies are retained.
+    ///
+    /// The initial value reflects persisted pruning. Later values follow successful
+    /// writes, before their callers publish the corresponding verified tip. Archive
+    /// state publishes zero. Genesis is always retained separately, and checkpoint
+    /// retention can put this floor above the current verified tip.
+    /// Read-only secondary databases refresh it when they catch up with the primary.
+    pub fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<block::Height> {
+        self.db.subscribe_retained_block_height()
     }
 
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
@@ -1182,18 +1660,26 @@ impl ReadStateService {
         self.vct_root_repair_receiver.clone()
     }
 
-    /// Subscribe to durable completed-checkpoint advances.
-    pub fn subscribe_highest_completed_checkpoint(
+    /// Subscribe to snapshots published only after a durable header-engine commit.
+    pub fn subscribe_header_chain_snapshots(
         &self,
-    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>> {
-        self.highest_completed_checkpoint_receiver.clone()
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+        self.header_chain_snapshot_receiver.clone()
     }
 
-    /// Subscribe to compact durable header-root authentication progress.
-    pub fn subscribe_header_root_auth(
+    /// Subscribe to atomic snapshots and body-work epochs after durable commits.
+    pub fn subscribe_header_chain_views(
         &self,
-    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>> {
-        self.header_root_auth_receiver.clone()
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>> {
+        self.header_chain_view_receiver.clone()
+    }
+
+    /// Subscribe to explicit durable header-runtime attachment and readiness state.
+    pub fn subscribe_header_runtime_status(
+        &self,
+    ) -> tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>
+    {
+        self.header_runtime_status_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -1207,9 +1693,10 @@ impl ReadStateService {
             .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned())
     }
 
-    /// Test-only access to the inner database.
+    /// Returns the shared database handle.
+    ///
     /// Can be used to modify the database without doing any consensus checks.
-    #[cfg(any(test, feature = "proptest-impl"))]
+    #[cfg(any(test, feature = "indexer", feature = "proptest-impl"))]
     pub fn db(&self) -> &ZakuraDb {
         &self.db
     }
@@ -1229,6 +1716,8 @@ impl Service<Request> for StateService {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Check for panics in the block write task
         let poll = self.read_service.poll_ready(cx);
+
+        self.poll_non_finalized_write_failures(cx);
 
         // Hand off from finalized to non-finalized writes as soon as the final checkpoint block is
         // durably written, without waiting for a semantically verified block to arrive.
@@ -1270,6 +1759,61 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
+            Request::ApplyHeaderChainInsert { prepared } => {
+                let rsp_rx = self.send_header_chain_insert(prepared);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainInsertApplied)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RecordHeaderChainBodyUnavailable { prepared } => {
+                let rsp_rx = self.send_header_chain_body_unavailable(prepared);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyUnavailableRecorded)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RecordHeaderChainBodyInvalid { prepared } => {
+                let rsp_rx = self.send_header_chain_body_invalid(prepared);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyInvalidRecorded)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RestartHeaderChainBodyAvailability { prepared } => {
+                let rsp_rx = self.send_header_chain_body_availability_restart(prepared);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyAvailabilityRestarted)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RetryHeaderChainBodyAvailability { prepared } => {
+                let rsp_rx = self.send_header_chain_body_availability_retry(prepared);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyAvailabilityRetried)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
             // Uses non_finalized_state_queued_blocks and pending_utxos in the StateService
             // Accesses shared writeable state in the StateService, NonFinalizedState, and ZakuraDb.
             //
@@ -1294,7 +1838,7 @@ impl Service<Request> for StateService {
 
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(semantically_verified)
+                        self.queue_and_commit_to_non_finalized_state(semantically_verified, None)
                     })
                 });
 
@@ -1308,6 +1852,44 @@ impl Service<Request> for StateService {
                 // Await the channel response, flatten the result, map receive errors to
                 // `CommitSemanticallyVerifiedError::WriteTaskExited`.
                 // Then flatten the nested Result and convert any errors to a BoxError.
+                let span = Span::current();
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
+                        .and_then(|result| result)
+                        .map_err(BoxError::from)
+                        .map(Response::Committed)
+                }
+                .instrument(span)
+                .boxed()
+            }
+
+            Request::CommitSemanticallyVerifiedBlockWithAdmission {
+                block,
+                admission,
+                requested_at,
+            } => {
+                let timer = CodeTimer::start();
+                metrics::histogram!("state.semantic_commit.dispatch.duration_seconds")
+                    .record(requested_at.elapsed().as_secs_f64());
+
+                let prequeue_checks_start = Instant::now();
+                self.assert_block_can_be_validated(&block);
+                self.pending_utxos.check_against_ordered(&block.new_outputs);
+                metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
+                    .record(prequeue_checks_start.elapsed().as_secs_f64());
+
+                let queue_send_start = Instant::now();
+                let rsp_rx = tokio::task::block_in_place(move || {
+                    span.in_scope(|| {
+                        self.queue_and_commit_to_non_finalized_state(block, Some(admission))
+                    })
+                });
+                metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
+                    .record(queue_send_start.elapsed().as_secs_f64());
+
+                timer.finish_desc("CommitSemanticallyVerifiedBlockWithAdmission");
                 let span = Span::current();
                 async move {
                     rsp_rx
@@ -1366,67 +1948,6 @@ impl Service<Request> for StateService {
                         .and_then(|result| result)
                         .map_err(BoxError::from)
                         .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
-            Request::CommitHeaderRange {
-                anchor,
-                headers,
-                body_sizes,
-                tree_aux_roots,
-            } => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
-                    })
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| CommitHeaderRangeError::CommitResponseDropped)
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
-            Request::AuthenticateHeaderRoots {
-                expected_state,
-                anchor,
-                start,
-                headers,
-                roots,
-            } => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.send_authenticate_header_roots(
-                            expected_state,
-                            anchor,
-                            start,
-                            headers,
-                            roots,
-                        )
-                    })
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_| {
-                            finalized_state::AuthenticateHeaderRootsError::Frontier(
-                                finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
-                            )
-                        })
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::AuthenticatedHeaderRoots)
                 }
                 .instrument(span)
                 .boxed()
@@ -1510,9 +2031,12 @@ impl Service<Request> for StateService {
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
-                self.drain_non_finalized_rejected_hashes();
-
                 let timer = CodeTimer::start();
+                // The write task reports rejected bodies asynchronously.
+                // Drain those reports before consulting the sent set.
+                // This order prevents the sent set from classifying a different body with the
+                // same header hash as a duplicate.
+                self.drain_non_finalized_rejected_hashes();
                 let sent_hash_response = self.known_sent_hash(&hash);
                 let read_service = self.read_service.clone();
 
@@ -1559,6 +2083,7 @@ impl Service<Request> for StateService {
 
             // The expected error type for this request is `ReconsiderError`
             Request::ReconsiderBlock(block_hash) => {
+                let invalidated_parents = self.optimistic_relay_invalidated_parents.clone();
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| self.send_reconsider_block(block_hash))
                 });
@@ -1568,10 +2093,21 @@ impl Service<Request> for StateService {
                 // Then flatten the nested Result and convert any errors to a BoxError.
                 let span = Span::current();
                 async move {
-                    rsp_rx
+                    let reconsidered = rsp_rx
                         .await
                         .map_err(|_recv_error| ReconsiderError::ReconsiderResponseDropped)
-                        .and_then(|result| result)
+                        .and_then(|result| result);
+
+                    // Only a confirmed reconsideration releases the parent for optimistic relay.
+                    // A failed one leaves the block invalidated, so it must stay blocked.
+                    if reconsidered.is_ok() {
+                        StateService::release_optimistic_relay_invalidation(
+                            &invalidated_parents,
+                            block_hash,
+                        );
+                    }
+
+                    reconsidered
                         .map_err(BoxError::from)
                         .map(Response::Reconsidered)
                 }
@@ -1586,15 +2122,14 @@ impl Service<Request> for StateService {
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator
             | Request::Transaction(_)
-            | Request::AnyChainTransaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::Block(_)
             | Request::AnyChainBlock(_)
-            | Request::BlockAndSize(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::CheckPreparedMinedRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
@@ -1615,95 +2150,458 @@ impl Service<Request> for StateService {
     }
 }
 
-fn headers_by_height_range<C>(
-    chain: Option<C>,
-    db: &ZakuraDb,
-    start: block::Height,
-    count: u32,
-) -> Vec<(block::Height, block::Hash, Arc<block::Header>)>
-where
-    C: AsRef<Chain> + Clone,
-{
-    let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
-    let mut headers = Vec::with_capacity(
-        usize::try_from(capped_count).expect("capped header count fits in usize"),
-    );
-    let mut height = start;
-
-    for _ in 0..capped_count {
-        let next_header = read::hash_by_height(chain.clone(), db, height)
-            .and_then(|hash| {
-                read::block_header(chain.clone(), db, height.into())
-                    .map(|header| (height, hash, header))
-            })
-            .or_else(|| db.headers_by_height_range(height, 1).into_iter().next());
-
-        let Some(header) = next_header else {
-            break;
-        };
-
-        headers.push(header);
-
-        let Ok(next_height) = height.next() else {
-            break;
-        };
-        height = next_height;
+fn highest_common_body_header_frontier(
+    mut height: block::Height,
+    minimum_height: block::Height,
+    mut body_hash: impl FnMut(block::Height) -> Option<block::Hash>,
+    mut selected_hash: impl FnMut(
+        block::Height,
+    ) -> Result<
+        Option<block::Hash>,
+        finalized_state::header_chain::HeaderChainStoreError,
+    >,
+) -> Result<zakura_header_chain::Frontier, finalized_state::header_chain::HeaderChainStoreError> {
+    loop {
+        let body_hash = body_hash(height);
+        let selected_hash = selected_hash(height)?;
+        if let (Some(body_hash), Some(selected_hash)) = (body_hash, selected_hash) {
+            if body_hash == selected_hash {
+                return Ok(zakura_header_chain::Frontier::new(height, body_hash));
+            }
+        }
+        if height <= minimum_height {
+            return Err(
+                finalized_state::header_chain::HeaderChainStoreError::Incoherent(
+                    "selected headers and full state have no common ancestor",
+                ),
+            );
+        }
+        height = block::Height(height.0.saturating_sub(1));
     }
-
-    headers
 }
 
 fn missing_block_body_metadata<C>(
-    chain: Option<C>,
+    latest_chain: impl FnOnce() -> Option<C>,
     db: &ZakuraDb,
+    header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     from: block::Height,
     limit: u32,
-) -> Vec<(block::Height, block::Hash, Option<u32>)>
+) -> Result<crate::BlockSyncBodyMetadata, finalized_state::header_chain::HeaderChainStoreError>
 where
     C: AsRef<Chain> + Clone,
 {
-    let verified_block_tip = read::tip_height(chain.clone(), db);
-    let best_header_tip = db
-        .best_header_tip()
-        .map(|(height, _)| height)
-        .max(verified_block_tip);
+    let (chain, verified_block_tip, selected_projection) = match header_chain {
+        Some(reader) => {
+            let ((chain, verified_block_tip), selected_projection) = reader
+                .with_selected_projection(|| {
+                    let chain = latest_chain();
+                    let verified_block_tip = read::tip(chain.clone(), db);
+                    (chain, verified_block_tip)
+                })?;
+            (chain, verified_block_tip, Some(selected_projection))
+        }
+        None => {
+            let chain = latest_chain();
+            let verified_block_tip = read::tip(chain.clone(), db);
+            (chain, verified_block_tip, None)
+        }
+    };
+    let best_header_tip = match &selected_projection {
+        Some(selected_projection) => selected_projection.last().copied(),
+        None => verified_block_tip
+            .map(|(height, hash)| zakura_header_chain::Frontier::new(height, hash)),
+    };
     let Some(best_header_tip) = best_header_tip else {
-        return Vec::new();
+        return Err(
+            finalized_state::header_chain::HeaderChainStoreError::Incoherent(
+                "block sync has no selected or full-state frontier",
+            ),
+        );
     };
 
-    let start = verified_block_tip
-        .and_then(|tip| tip.next().ok())
-        .map_or(from, |first_missing| first_missing.max(from));
+    let anchor = match (verified_block_tip, selected_projection.as_deref()) {
+        (Some((verified_height, _verified_hash)), Some(selected_projection)) => {
+            let minimum_height = selected_projection
+                .first()
+                .expect("the selected projection has a best header")
+                .height;
+            highest_common_body_header_frontier(
+                verified_height.min(best_header_tip.height),
+                minimum_height,
+                |height| read::hash_by_height(chain.clone(), db, height),
+                |height| {
+                    Ok(selected_projection
+                        .binary_search_by_key(&height, |frontier| frontier.height)
+                        .ok()
+                        .map(|index| selected_projection[index].hash))
+                },
+            )?
+        }
+        (Some((height, hash)), None) => zakura_header_chain::Frontier::new(height, hash),
+        (None, Some(_)) => {
+            return Err(
+                finalized_state::header_chain::HeaderChainStoreError::Incoherent(
+                    "selected headers exist without a full-state anchor",
+                ),
+            );
+        }
+        (None, None) => unreachable!("the absent-frontier case returned above"),
+    };
 
-    if start > best_header_tip {
-        return Vec::new();
+    let first_selected = anchor.height.next().unwrap_or(anchor.height);
+    let repairing_fork = verified_block_tip.is_some_and(|tip| tip != (anchor.height, anchor.hash));
+    let verified_successor = verified_block_tip.and_then(|(height, _)| height.next().ok());
+    let start = if repairing_fork && verified_successor == Some(from) {
+        first_selected
+    } else {
+        first_selected.max(from)
+    };
+
+    if start > best_header_tip.height {
+        return Ok(crate::BlockSyncBodyMetadata {
+            anchor,
+            blocks: Vec::new(),
+        });
     }
 
-    let count = limit
-        .min(MAX_HEADER_SYNC_HEIGHT_RANGE)
-        .min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
+    let count = limit.min(MAX_HEADER_SYNC_HEIGHT_RANGE).min(
+        best_header_tip
+            .height
+            .0
+            .saturating_sub(start.0)
+            .saturating_add(1),
+    );
     let size_hints: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
         .into_iter()
         .collect();
+    let selected_hashes: HashMap<_, _> = match selected_projection.as_deref() {
+        Some(selected_projection) => selected_projection
+            .iter()
+            .copied()
+            .filter(|frontier| {
+                frontier.height >= start && frontier.height <= best_header_tip.height
+            })
+            .map(|frontier| (frontier.height, frontier.hash))
+            .collect(),
+        None => HashMap::new(),
+    };
 
-    (0..count)
-        .filter_map(|offset| start.0.checked_add(offset).map(block::Height))
-        .filter(|height| !db.contains_body_at_height(*height))
-        .filter_map(|height| {
-            read::hash_by_height(chain.clone(), db, height)
-                .or_else(|| db.header_hash(height))
-                .map(|hash| (height, hash, size_hints.get(&height).copied().flatten()))
-        })
-        .take(usize::try_from(limit).expect("u32 limit fits in usize on supported targets"))
-        .collect()
+    let mut metadata = Vec::new();
+    for offset in 0..count {
+        let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+            break;
+        };
+        let body_hash = read::hash_by_height(chain.clone(), db, height);
+        let selected_hash = match header_chain {
+            Some(_) => selected_hashes.get(&height).copied(),
+            None => body_hash,
+        };
+        let Some(hash) = selected_hash else {
+            continue;
+        };
+        if db.contains_body_at_height(height) && body_hash == Some(hash) {
+            continue;
+        }
+        metadata.push((height, hash, size_hints.get(&height).copied().flatten()));
+    }
+
+    Ok(crate::BlockSyncBodyMetadata {
+        anchor,
+        blocks: metadata,
+    })
+}
+
+/// Returns the index range a subtree request covers, as a concrete range type.
+///
+/// Mirrors the read path's handling of an absent or overflowing end bound, where the request is
+/// served to the end of what exists.
+fn range_for(
+    start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
+) -> (
+    Bound<NoteCommitmentSubtreeIndex>,
+    Bound<NoteCommitmentSubtreeIndex>,
+) {
+    (
+        Bound::Included(start_index),
+        end_index.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+/// Uses published subtrees when the node's own rows do not cover `start_index`.
+///
+/// The read result already applies the continuity contract and reports the absent band, so it
+/// stands on its own when it covers `start_index`. Otherwise, this helper tries the skip-band
+/// union supplied by `merge_published` and rechecks availability over that whole union — including
+/// published records that complete above `verified_tip`. Serving then drops those not-yet-reached
+/// records so a mid-sync prefix is returned instead of a permanent hole. If `start_index` is in
+/// the union but not yet completed at this tip, the answer is an empty list, the same as asking
+/// past the tip. If the union still does not contain `start_index`, the original result stands,
+/// including its typed absent-band error.
+fn subtrees_with_published_fallback<Node, Error>(
+    stored: Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error>,
+    start_index: NoteCommitmentSubtreeIndex,
+    verified_tip: Option<block::Height>,
+    merge_published: impl FnOnce() -> Option<
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    >,
+    check_available: impl FnOnce(
+        &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    ) -> Result<(), Error>,
+) -> Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error> {
+    match stored {
+        Ok(subtrees) if subtrees.contains_key(&start_index) => Ok(subtrees),
+        result => {
+            let Some(verified_tip) = verified_tip else {
+                return result;
+            };
+            let Some(mut merged) = merge_published() else {
+                return result;
+            };
+
+            check_available(&merged)?;
+            let start_in_skip_band = merged.contains_key(&start_index);
+            read::retain_subtrees_completed_at_or_below(&mut merged, verified_tip);
+            let merged = read::contiguous_subtrees_from(merged, start_index);
+
+            if merged.contains_key(&start_index) {
+                Ok(merged)
+            } else if start_in_skip_band {
+                Ok(BTreeMap::new())
+            } else {
+                result
+            }
+        }
+    }
+}
+
+/// A decoded frontier artifact waiting for the database-dependent coverage check.
+struct LoadedHistoricalFrontierArtifact {
+    cache: Arc<Mutex<read::HistoricalTreeCache>>,
+    last_checkpoint: Option<block::Height>,
+    source_path: Option<PathBuf>,
+}
+
+impl LoadedHistoricalFrontierArtifact {
+    /// Discards a frontier grid that ends below this database's durable VCT handoff, leaving
+    /// historical trees in the absent band unavailable instead of preventing startup.
+    ///
+    /// When the handoff marker has not been written yet, the grid is retained because its coverage
+    /// cannot be checked. Serving checks again after ordinary fast-sync commits write the marker
+    /// and reports the affected historical trees as unavailable if the grid is too old.
+    fn discard_if_before_vct_handoff(
+        self,
+        config: &Config,
+        db: &ZakuraDb,
+    ) -> Arc<Mutex<read::HistoricalTreeCache>> {
+        if config.derive_historical_trees(db.vct_synced_below().is_some()) {
+            if let Some((artifact_checkpoint, vct_handoff)) =
+                frontier_grid_ends_before_vct_handoff(self.last_checkpoint, db.vct_synced_below())
+            {
+                let source_path = self
+                    .source_path
+                    .expect("a loaded artifact has a source description");
+                tracing::warn!(
+                    path = ?source_path,
+                    ?artifact_checkpoint,
+                    ?vct_handoff,
+                    "ignoring historical frontier artifact that does not cover the database's VCT \
+                     handoff"
+                );
+                return Arc::new(Mutex::new(read::HistoricalTreeCache::default()));
+            }
+        }
+
+        self.cache
+    }
+}
+
+/// Returns the artifact checkpoint and database handoff when the published grid ends below this
+/// database's skip band.
+///
+/// `None` means the comparison cannot be made yet — the grid is unloaded, or the durable last
+/// checkpoint marker has not been written — or the grid already covers the band.
+fn frontier_grid_ends_before_vct_handoff(
+    artifact_checkpoint: Option<block::Height>,
+    vct_handoff: Option<block::Height>,
+) -> Option<(block::Height, block::Height)> {
+    artifact_checkpoint
+        .zip(vct_handoff)
+        .filter(|(artifact_checkpoint, vct_handoff)| artifact_checkpoint < vct_handoff)
+}
+
+/// Returns the cold-request replay length when it exceeds `limit`.
+///
+/// Gaps are measured from genesis: a published grid is a chain-shaped artifact, so a file that
+/// starts at a mid-chain `U` cannot serve a from-scratch node below `U`. `limit` is the same
+/// bound serving applies per request, so a grid that passes here cannot produce a cold request
+/// the read path would then refuse.
+fn frontier_grid_gap_exceeds_replay_limit(
+    artifact: &finalized_state::FrontierArtifact,
+    limit: u64,
+) -> Option<u64> {
+    let blocks = artifact.max_cold_replay_blocks();
+    (blocks > limit).then_some(blocks)
+}
+
+/// Loads the configured frontier grid override or the embedded Mainnet grid into a fresh cache.
+///
+/// Mainnet needs no deployment-time file: its reviewed grid is part of the binary. An explicit
+/// path overrides that grid, and an unreadable or invalid override is fatal for a node that
+/// derives ([`Config::derive_historical_trees`]) and a warning for one that does not. Networks
+/// without an embedded or configured grid keep reporting the absent band as unavailable. A
+/// well-framed artifact is still refused unless its entries tile genesis through
+/// `last_checkpoint` at gaps of at most [`MAX_HISTORICAL_TREE_REPLAY_BLOCKS`].
+fn load_historical_frontier_artifact(
+    network: &Network,
+    config: &Config,
+    database_was_vct_fast_synced: bool,
+) -> Result<LoadedHistoricalFrontierArtifact, StateInitError> {
+    load_historical_frontier_artifact_if_enabled(
+        network,
+        config,
+        config.derive_historical_trees(database_was_vct_fast_synced),
+    )
+}
+
+fn load_historical_frontier_artifact_if_enabled(
+    network: &Network,
+    config: &Config,
+    derivation_enabled: bool,
+) -> Result<LoadedHistoricalFrontierArtifact, StateInitError> {
+    let (artifact, source_path) = if let Some(path) = config.historical_frontier_artifact.as_ref() {
+        (
+            std::fs::read(path)
+                .map_err(|error| Box::new(error) as BoxError)
+                .and_then(|bytes| {
+                    finalized_state::FrontierArtifact::decode(&bytes, network)
+                        .map(Arc::new)
+                        .map_err(|error| Box::new(error) as BoxError)
+                }),
+            path.clone(),
+        )
+    } else if derivation_enabled {
+        let Some(artifact) = finalized_state::embedded_historical_frontier_artifact(network) else {
+            tracing::info!(
+                "historical tree derivation is idle: this network has no embedded historical \
+                 frontier artifact"
+            );
+
+            return Ok(LoadedHistoricalFrontierArtifact {
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+                last_checkpoint: None,
+                source_path: None,
+            });
+        };
+
+        (
+            Ok(artifact),
+            PathBuf::from("embedded Mainnet historical frontier artifact"),
+        )
+    } else {
+        return Ok(LoadedHistoricalFrontierArtifact {
+            cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+            last_checkpoint: None,
+            source_path: None,
+        });
+    };
+
+    match artifact {
+        Ok(artifact) => {
+            if derivation_enabled {
+                if let Some(blocks) = frontier_grid_gap_exceeds_replay_limit(
+                    &artifact,
+                    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                ) {
+                    return Err(StateInitError::HistoricalFrontierArtifactTooSparse {
+                        path: source_path,
+                        blocks,
+                        limit: MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                    });
+                }
+            }
+
+            tracing::info!(
+                ?source_path,
+                entries = artifact.entries.len(),
+                spacing = artifact.spacing,
+                "loaded historical frontier artifact"
+            );
+            Ok(LoadedHistoricalFrontierArtifact {
+                last_checkpoint: Some(artifact.last_checkpoint),
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::with_artifact(
+                    artifact,
+                ))),
+                source_path: Some(source_path),
+            })
+        }
+        Err(source) if derivation_enabled => Err(StateInitError::HistoricalFrontierArtifact {
+            path: source_path,
+            source,
+        }),
+        Err(error) => {
+            tracing::warn!(?source_path, %error, "ignoring historical frontier artifact");
+            Ok(LoadedHistoricalFrontierArtifact {
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+                last_checkpoint: None,
+                source_path: None,
+            })
+        }
+    }
+}
+
+/// Derives the note commitment frontiers for `hash_or_height`, whose stored per-height trees are
+/// absent because this is a verified-commitment-trees fast-synced database.
+///
+/// Callers reach this only once a tree read has already reported the absent band, so `unavailable`
+/// is the error that stands if derivation is switched off or this node is pruned. Inside the band
+/// the request either derives a root-checked frontier or fails: an absent tree there must never
+/// reach a client as an empty treestate (see [`crate::HistoricalTreeUnavailable`]).
+fn historical_frontiers(
+    state: &ReadStateService,
+    hash_or_height: HashOrHeight,
+    unavailable: HistoricalTreeUnavailable,
+) -> Result<Arc<read::DerivedFrontiers>, BoxError> {
+    // Archive mode is part of this: replay needs every block body from the selected anchor through
+    // the requested height, and pruned mode does not guarantee that range.
+    if !state
+        .db
+        .config()
+        .derive_historical_trees(state.db.vct_synced_below().is_some())
+    {
+        return Err(unavailable.into());
+    }
+
+    // Derivation anchors on the published grid. Without one the nearest anchor is the stored
+    // frontier below the absent band, so a cold request would replay the band end to end — the
+    // cost this design exists to avoid. Report the band as unavailable instead.
+    if !state.has_usable_historical_frontier_grid() {
+        return Err(unavailable.into());
+    }
+
+    let Some(height) = hash_or_height.height_or_else(|hash| state.db.height(hash)) else {
+        // The absent-band check resolved this block to a height, so failing to resolve it again
+        // means the database changed underneath the read. Report the original error rather than
+        // an empty tree.
+        return Err(unavailable.into());
+    };
+
+    read::derive_historical_frontiers(
+        &state.db,
+        &state.historical_trees,
+        height,
+        MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    )
+    .map_err(BoxError::from)
 }
 
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
+    header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     start: block::Height,
     count: u32,
-) -> Vec<BlockCommitmentRoots>
+) -> Result<Vec<BlockCommitmentRoots>, HeaderChainStoreError>
 where
     C: AsRef<Chain>,
 {
@@ -1716,15 +2614,17 @@ where
         Some(_) => "mixed",
     };
     metrics::counter!("state.block_roots.response", "source" => source).increment(1);
-    let mut roots =
-        Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
+    let mut roots = Vec::new();
+    let mut selected_aux_roots: Option<std::vec::IntoIter<BlockCommitmentRoots>> = None;
 
     for offset in 0..capped_count {
         let Some(height) = start + i64::from(offset) else {
             break;
         };
 
-        let root = if db
+        let root = if let Some(selected_aux_roots) = selected_aux_roots.as_mut() {
+            selected_aux_roots.next()
+        } else if db
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
@@ -1773,9 +2673,17 @@ where
                 _ => None,
             }
         } else {
-            db.commitment_roots_by_height_range(height..=height)
-                .into_iter()
-                .next()
+            if selected_aux_roots.is_none() {
+                let remaining = capped_count.saturating_sub(offset);
+                selected_aux_roots = Some(
+                    header_chain
+                        .map(|reader| reader.selected_block_roots(height, remaining))
+                        .transpose()?
+                        .unwrap_or_default()
+                        .into_iter(),
+                );
+            }
+            selected_aux_roots.as_mut().and_then(Iterator::next)
         };
 
         let Some(root) = root else {
@@ -1789,7 +2697,7 @@ where
         roots.push(root);
     }
 
-    roots
+    Ok(roots)
 }
 
 impl Service<ReadRequest> for ReadStateService {
@@ -1799,23 +2707,41 @@ impl Service<ReadRequest> for ReadStateService {
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if let Some(error) = self.block_write_failure.get() {
+            return Poll::Ready(Err(Box::new(error.clone())));
+        }
+
         // Check for panics in the block write task
         //
         // TODO: move into a check_for_panics() method
-        let block_write_task = self.block_write_task.take();
-
-        if let Some(block_write_task) = block_write_task {
+        if let Some(block_write_task) = self.block_write_task.take() {
             if block_write_task.is_finished() {
-                if let Some(block_write_task) = Arc::into_inner(block_write_task) {
-                    // We are the last state with a reference to this task, so we can propagate any panics
-                    if let Err(thread_panic) = block_write_task.join() {
-                        std::panic::resume_unwind(thread_panic);
+                match Arc::try_unwrap(block_write_task) {
+                    Ok(block_write_task) => {
+                        // This state owns the last task reference and can propagate any panic.
+                        match block_write_task.join() {
+                            Err(thread_panic) => std::panic::resume_unwind(thread_panic),
+                            Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
+                                return Poll::Ready(Err(Box::new(error)));
+                            }
+                            Ok(write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)) => {
+                                return Poll::Ready(Err(Box::new(error)));
+                            }
+                            Ok(write::BlockWriteTaskExit::Completed) => {}
+                        }
+                    }
+                    Err(block_write_task) => {
+                        self.block_write_task = Some(block_write_task);
                     }
                 }
             } else {
                 // It hasn't finished, so we need to put it back
                 self.block_write_task = Some(block_write_task);
             }
+        }
+
+        if let Some(error) = self.block_write_failure.get() {
+            return Poll::Ready(Err(Box::new(error.clone())));
         }
 
         self.db.check_for_panics();
@@ -1849,7 +2775,7 @@ impl Service<ReadRequest> for ReadStateService {
 
         let request_handler = move || match req {
             // Used by the `getblockchaininfo` RPC.
-            ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.size())),
+            ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.cached_size())),
 
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::PruningInfo => Ok(ReadResponse::PruningInfo {
@@ -2024,9 +2950,96 @@ impl Service<ReadRequest> for ReadStateService {
                 .collect(),
             )),
 
-            ReadRequest::HeadersByHeightRange { start, count } => Ok(ReadResponse::Headers(
-                headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
-            )),
+            ReadRequest::HeaderLocator => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let locator = reader
+                    .map(|reader| reader.committed_selected_locator())
+                    .transpose()?;
+                Ok(ReadResponse::HeaderLocator(locator))
+            }
+
+            ReadRequest::HeaderValidationLease { parent_hash } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let lease = reader
+                    .map(|reader| reader.validation_context(parent_hash))
+                    .transpose()?
+                    .flatten();
+                Ok(ReadResponse::HeaderValidationLease(lease))
+            }
+
+            ReadRequest::VctRepairContext { owner, height } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let context = reader
+                    .map(|reader| {
+                        reader.vct_repair_context_bounded(
+                            owner,
+                            height,
+                            state.max_checkpoint_height,
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                Ok(ReadResponse::VctRepairContext(context))
+            }
+
+            ReadRequest::AcquireRetainedHeaderPath {
+                peer,
+                session_id,
+                target_tip_hash,
+                scope,
+                locator_hashes,
+            } => {
+                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
+                    return Ok(ReadResponse::RetainedHeaderPathLease(
+                        crate::RetainedPathLeaseOutcome::TargetNotRetained,
+                    ));
+                };
+                Ok(ReadResponse::RetainedHeaderPathLease(
+                    reader.acquire_retained_path(
+                        peer,
+                        session_id,
+                        target_tip_hash,
+                        &locator_hashes,
+                        scope,
+                    )?,
+                ))
+            }
+
+            ReadRequest::ReadRetainedHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+                scope,
+                after_hash,
+                max_count,
+            } => {
+                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
+                    return Ok(ReadResponse::RetainedHeaderPathPage(
+                        crate::RetainedPathReadOutcome::Unavailable,
+                    ));
+                };
+                Ok(ReadResponse::RetainedHeaderPathPage(
+                    reader.read_retained_path(
+                        peer, session_id, lease_id, scope, after_hash, max_count,
+                    )?,
+                ))
+            }
+
+            ReadRequest::ReleaseRetainedHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+                scope,
+            } => {
+                let released = state
+                    .header_chain_reader_receiver
+                    .borrow()
+                    .clone()
+                    .map(|reader| reader.release_retained_path(peer, session_id, lease_id, scope))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(ReadResponse::RetainedHeaderPathReleased(released))
+            }
 
             ReadRequest::BlockRoots {
                 start_height,
@@ -2038,42 +3051,42 @@ impl Service<ReadRequest> for ReadStateService {
                     block_roots_by_height_range(
                         state.latest_best_chain(),
                         &state.db,
+                        state.header_chain_reader_receiver.borrow().as_ref(),
                         start_height,
                         count,
-                    )
+                    )?
                 };
 
                 Ok(ReadResponse::BlockRoots(roots))
             }
 
-            ReadRequest::BestDurableHeaderTip => Ok(ReadResponse::BestDurableHeaderTip(
-                state.db.best_header_tip(),
-            )),
-
-            ReadRequest::MissingBlockBodies { from, limit } => {
-                let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
-                let best_header_tip = state
-                    .db
-                    .best_header_tip()
-                    .map(|(height, _)| height)
-                    .max(verified_block_tip);
-
-                Ok(ReadResponse::MissingBlockBodies(
-                    state
-                        .db
-                        .missing_block_bodies(verified_block_tip, best_header_tip, from, limit),
-                ))
+            ReadRequest::BestHeaderTip => {
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let tip = match header_chain_reader {
+                    Some(reader) => reader
+                        .selected_tip()
+                        .map(|tip| Some((tip.height, tip.hash)))?,
+                    None => read::tip(state.latest_best_chain(), &state.db),
+                };
+                Ok(ReadResponse::BestHeaderTip(tip))
             }
+
+            ReadRequest::HeaderChainSnapshot => Ok(ReadResponse::HeaderChainSnapshot(
+                state.header_chain_snapshot_receiver.borrow().clone(),
+            )),
 
             ReadRequest::MissingBlockBodyMetadata { from, limit } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
                 Ok(ReadResponse::MissingBlockBodyMetadata(
-                    missing_block_body_metadata(state.latest_best_chain(), &state.db, from, limit),
+                    missing_block_body_metadata(
+                        || state.latest_best_chain(),
+                        &state.db,
+                        reader.as_ref(),
+                        from,
+                        limit,
+                    )?,
                 ))
             }
-
-            ReadRequest::BlockSizeHints { from, count } => Ok(ReadResponse::BlockSizeHints(
-                read::block_size_hints(state.latest_best_chain(), &state.db, from, count),
-            )),
 
             ReadRequest::BlocksByHeightRange { start, count } => {
                 let best_chain = state.latest_best_chain();
@@ -2093,21 +3106,70 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
+            // Used by the indexer gRPC server.
+            #[cfg(feature = "indexer")]
+            ReadRequest::RawBlocksByHeightRange { start, count } => {
+                let blocks = (0..count)
+                    .map_while(|offset| {
+                        start
+                            .0
+                            .checked_add(offset)
+                            .map(block::Height)
+                            .and_then(|height| {
+                                state
+                                    .db
+                                    .raw_block_bytes(height.into())
+                                    .map(|bytes| (height, bytes))
+                            })
+                    })
+                    .collect();
+
+                Ok(ReadResponse::RawBlocks(blocks))
+            }
+
             ReadRequest::SaplingTree(hash_or_height) => {
-                let tree =
-                    read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                let tree = match read::sapling_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .sapling
+                            .clone(),
+                    ),
+                };
                 Ok(ReadResponse::SaplingTree(tree))
             }
 
             ReadRequest::OrchardTree(hash_or_height) => {
-                let tree =
-                    read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                let tree = match read::orchard_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .orchard
+                            .clone(),
+                    ),
+                };
                 Ok(ReadResponse::OrchardTree(tree))
             }
 
             ReadRequest::IronwoodTree(hash_or_height) => {
                 let tree =
-                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                    match read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)
+                    {
+                        Ok(tree) => tree,
+                        Err(unavailable) => Some(
+                            historical_frontiers(&state, hash_or_height, unavailable)?
+                                .ironwood
+                                .clone(),
+                        ),
+                    };
                 Ok(ReadResponse::IronwoodTree(tree))
             }
 
@@ -2117,15 +3179,45 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let sapling_subtrees = if let Some(end_index) = end_index {
-                    read::sapling_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::sapling_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
                     // If there is no end bound, just return all the trees.
                     // If the end bound would overflow, just returns all the trees, because that's what
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
-                    read::sapling_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                    read::sapling_subtrees(best_chain.clone(), &state.db, start_index..)
+                };
+
+                let sapling_subtrees = subtrees_with_published_fallback(
+                    sapling_subtrees,
+                    start_index,
+                    verified_tip,
+                    || {
+                        state.historical_subtrees_at_last_checkpoint().map(
+                            |(artifact, vct_applied_below)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.sapling_range(range),
+                                    vct_applied_below,
+                                );
+                                merged
+                            },
+                        )
+                    },
+                    |merged| {
+                        read::check_historical_sapling_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2136,15 +3228,45 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let orchard_subtrees = if let Some(end_index) = end_index {
-                    read::orchard_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::orchard_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
                     // If there is no end bound, just return all the trees.
                     // If the end bound would overflow, just returns all the trees, because that's what
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
-                    read::orchard_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                    read::orchard_subtrees(best_chain.clone(), &state.db, start_index..)
+                };
+
+                let orchard_subtrees = subtrees_with_published_fallback(
+                    orchard_subtrees,
+                    start_index,
+                    verified_tip,
+                    || {
+                        state.historical_subtrees_at_last_checkpoint().map(
+                            |(artifact, vct_applied_below)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.orchard_range(range),
+                                    vct_applied_below,
+                                );
+                                merged
+                            },
+                        )
+                    },
+                    |merged| {
+                        read::check_historical_orchard_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
@@ -2155,11 +3277,41 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let ironwood_subtrees = if let Some(end_index) = end_index {
-                    read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
-                    read::ironwood_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                    read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..)
+                };
+
+                let ironwood_subtrees = subtrees_with_published_fallback(
+                    ironwood_subtrees,
+                    start_index,
+                    verified_tip,
+                    || {
+                        state.historical_subtrees_at_last_checkpoint().map(
+                            |(artifact, vct_applied_below)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.ironwood_range(range),
+                                    vct_applied_below,
+                                );
+                                merged
+                            },
+                        )
+                    },
+                    |merged| {
+                        read::check_historical_ironwood_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }
@@ -2198,7 +3350,7 @@ impl Service<ReadRequest> for ReadStateService {
                 check::nullifier::tx_no_duplicates_in_chain(
                     &state.db,
                     latest_non_finalized_best_chain.as_ref(),
-                    &unmined_tx.transaction,
+                    unmined_tx.transaction(),
                 )?;
 
                 check::anchors::tx_anchors_refer_to_final_treestates(
@@ -2208,6 +3360,18 @@ impl Service<ReadRequest> for ReadStateService {
                 )?;
 
                 Ok(ReadResponse::ValidBestChainTipNullifiersAndAnchors)
+            }
+
+            ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {
+                let latest_non_finalized_state = state.latest_non_finalized_state();
+                let eligibility = check_prepared_mined_relay_eligibility_for_state(
+                    &state.network,
+                    &latest_non_finalized_state,
+                    &state.db,
+                    commitment,
+                )?;
+
+                Ok(ReadResponse::PreparedMinedRelayEligibility(eligibility))
             }
 
             // Used by the get_block and get_block_hash RPCs.
@@ -2333,6 +3497,38 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
+            // Used by the getchaintips RPC.
+            ReadRequest::ChainTips => {
+                // Capture the header tip and its overlap with the block chain from
+                // one transition generation, so the two agree. The overlap stops at
+                // the block tip: the fork is never above it, and headers-first sync
+                // leaves tens of thousands of headers above it that would be copied
+                // and searched for nothing.
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let (non_finalized_state, header_tip, overlap) = match header_chain_reader {
+                    Some(reader) => {
+                        let (non_finalized_state, header_tip, overlap) = reader
+                            .with_selected_overlap(
+                                || state.latest_non_finalized_state(),
+                                |non_finalized_state| {
+                                    read::tip_height(non_finalized_state.best_chain(), &state.db)
+                                },
+                            )?;
+                        (non_finalized_state, Some(header_tip), overlap)
+                    }
+                    None => (state.latest_non_finalized_state(), None, Vec::new()),
+                };
+
+                Ok(ReadResponse::ChainTips(read::chain_tips(
+                    &non_finalized_state,
+                    &state.db,
+                    header_tip.map(|tip| read::SelectedHeaders {
+                        tip,
+                        overlap: &overlap,
+                    }),
+                )))
+            }
+
             ReadRequest::NonFinalizedBlocksListener { .. } => {
                 unreachable!("should return early");
             }
@@ -2345,6 +3541,75 @@ impl Service<ReadRequest> for ReadStateService {
         };
 
         timed_span.spawn_blocking(request_handler)
+    }
+}
+
+fn check_prepared_mined_relay_eligibility_for_state(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    commitment: BlockCommitmentData,
+) -> Result<PreparedMinedRelayEligibility, BoxError> {
+    let parent_hash = commitment.block.header.previous_block_hash;
+    let parent_chain =
+        non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
+    let history_tree = read::tree::history_tree(parent_chain, db, parent_hash.into());
+    let history_tree = match history_tree {
+        Some(history_tree) => history_tree,
+        None if matches!(
+            commitment.block.commitment(network)?,
+            block::Commitment::PreSaplingReserved(_)
+                | block::Commitment::FinalSaplingRoot(_)
+                | block::Commitment::ChainHistoryActivationReserved
+        ) =>
+        {
+            Arc::new(zakura_chain::history_tree::HistoryTree::default())
+        }
+        None => return Ok(PreparedMinedRelayEligibility::Unavailable),
+    };
+    check::block_commitment_is_valid_for_chain_history(
+        commitment.block.clone(),
+        network,
+        &history_tree,
+        commitment.auth_data_root,
+    )?;
+
+    // Take only the blocks `block_is_valid_for_recent_chain_data` reads. The
+    // iterator walks to genesis, so collecting it would load every ancestor
+    // block body into memory to check the most recent
+    // `POW_ADJUSTMENT_BLOCK_SPAN` of them.
+    let relevant_chain: Vec<_> = any_ancestor_blocks(non_finalized_state, db, parent_hash)
+        .take(POW_ADJUSTMENT_BLOCK_SPAN)
+        .collect();
+    if relevant_chain.is_empty() {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    }
+    let candidate_height = commitment
+        .block
+        .coinbase_height()
+        .ok_or(crate::ValidateContextError::NotReadyToBeCommitted)?;
+    let finalized_tip_height = db.finalized_tip_height().or_else(|| {
+        relevant_chain
+            .last()
+            .and_then(|block| block.coinbase_height())
+    });
+    check::block_is_valid_for_recent_chain_data(
+        &commitment.block,
+        candidate_height,
+        network,
+        finalized_tip_height,
+        relevant_chain,
+    )?;
+
+    if network.disable_pow() {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    }
+    let extends_selected_tip = read::best_tip(non_finalized_state, db)
+        .is_some_and(|(_, selected_tip_hash)| selected_tip_hash == parent_hash);
+    if extends_selected_tip {
+        Ok(PreparedMinedRelayEligibility::Authorized)
+    } else {
+        Ok(PreparedMinedRelayEligibility::CommitFirst)
     }
 }
 
@@ -2363,17 +3628,25 @@ impl Service<ReadRequest> for ReadStateService {
 /// It's possible to construct multiple state services in the same application (as
 /// long as they, e.g., use different storage locations), but doing so is
 /// probably not what you want.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
+/// artifact cannot be loaded.
 pub async fn init(
     config: Config,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> (
-    BoxService<Request, Response, BoxError>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-) {
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+    ),
+    StateInitError,
+> {
     let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
         StateService::new(
             config,
@@ -2381,30 +3654,77 @@ pub async fn init(
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
         )
-        .await;
+        .await?;
 
-    (
+    Ok((
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
+    ))
+}
+
+/// Initialize state and return the separate capability used to seal completion-gated body
+/// evidence before it enters the general-purpose state request service.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
+/// artifact cannot be loaded.
+pub async fn init_with_header_chain_body_evidence(
+    config: Config,
+    network: &Network,
+    max_checkpoint_height: block::Height,
+    checkpoint_verify_concurrency_limit: usize,
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        crate::HeaderChainBodyEvidenceAuthority,
+    ),
+    StateInitError,
+> {
+    let (state, read_state, latest_chain_tip, chain_tip_change) = init(
+        config,
+        network,
+        max_checkpoint_height,
+        checkpoint_verify_concurrency_limit,
     )
+    .await?;
+    Ok((
+        state,
+        read_state,
+        latest_chain_tip,
+        chain_tip_change,
+        crate::HeaderChainBodyEvidenceAuthority::new(),
+    ))
 }
 
 /// Initialize a state service from the provided [`Config`] and explicit node
-/// software metadata.
+/// software metadata. Returns the body-evidence authority used by the node.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its
+/// frontier artifact cannot be loaded.
 pub async fn init_with_database_writer_metadata(
     config: Config,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
     database_writer_metadata: DatabaseWriterMetadata,
-) -> (
-    BoxService<Request, Response, BoxError>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-) {
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        crate::HeaderChainBodyEvidenceAuthority,
+    ),
+    StateInitError,
+> {
     let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
         StateService::new_with_database_writer_metadata(
             config,
@@ -2413,14 +3733,15 @@ pub async fn init_with_database_writer_metadata(
             checkpoint_verify_concurrency_limit,
             database_writer_metadata,
         )
-        .await;
+        .await?;
 
-    (
+    Ok((
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
-    )
+        crate::HeaderChainBodyEvidenceAuthority::new(),
+    ))
 }
 
 /// Initialize a read state service from the provided [`Config`].
@@ -2441,24 +3762,44 @@ pub fn init_read_only(
     StateInitError,
 > {
     let finalized_state = FinalizedState::new_with_debug(&config, network, true, true)?;
+    let historical_trees = load_historical_frontier_artifact(
+        network,
+        &config,
+        finalized_state.db.vct_synced_below().is_some(),
+    )?;
+    let historical_trees =
+        historical_trees.discard_if_before_vct_handoff(&config, &finalized_state.db);
     let (non_finalized_state_sender, non_finalized_state_receiver) =
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
-    let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
-        finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db);
-    let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
-    let (_header_root_auth_sender, header_root_auth_receiver) = tokio::sync::watch::channel(None);
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
+                epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+                reason: zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+            },
+        );
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
 
     Ok((
         ReadStateService::new(
             &finalized_state,
             None,
+            Arc::new(OnceLock::new()),
             WatchReceiver::new(non_finalized_state_receiver),
-            highest_completed_checkpoint_receiver,
-            highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            HeaderChainSubscriptions {
+                snapshots: header_chain_snapshot_receiver,
+                views: header_chain_view_receiver,
+                runtime_status: header_runtime_status_receiver,
+                reader: header_chain_reader_receiver,
+            },
+            historical_trees,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,
@@ -2498,7 +3839,9 @@ pub async fn init_test(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -2519,7 +3862,9 @@ pub async fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

@@ -99,8 +99,14 @@ For crates.io publishing:
    `./scripts/check-crate-publish-graph.sh` dry-run-publishes the publish
    set against the live index, then asserts that the Cargo.lock cargo
    writes into each packaged archive resolves every workspace crate at its
-   workspace version — a duplicated major passes the dry-run itself. It is
-   step 5 of `make pre-release`.
+   workspace version — a duplicated major passes the dry-run itself. PR CI
+   runs the same script as the `crates.io publish graph` job in
+   `tests-unit.yml` (part of `test success`), so a missing cascade bump
+   cannot merge. It is also step 5 of `make pre-release`.
+7. Reserve any crate name the release adds. The same check warns when a
+   selected crate has never been published; CI cannot bootstrap it, because
+   its crates.io Trusted Publishing entry lives on a crate that must already
+   exist. Publish the name manually and configure it before the release.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.
@@ -162,7 +168,9 @@ make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
 `check-crate-publish-graph.sh` needs network access and is the only check
 that resolves the publish set against the live index — packaging checks
 resolve every crate locally and cannot see that a published crate would be
-skipped. For a deliberately GitHub-only release candidate the documented
+skipped. PR CI runs it on every Cargo.toml change and in the merge queue
+so `main` stays publishable; `make pre-release` runs it again at release
+time. For a deliberately GitHub-only release candidate the documented
 override is `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` (workflow input
 `allow_unpublishable_crate_graph`); crates must not be published under it.
 
@@ -227,16 +235,28 @@ The workflow must:
 1. validate the tag against the `zakura` package version
 2. boot from a retained Mainnet state below the VCT handoff and prove finalized
    state crosses it using the Zakura P2P stack
-3. build and verify assets before tag creation
-4. wait for approval of the `release` environment
-5. create the immutable tag and GitHub pre-release
-6. publish the release assets; the tag push then triggers
+3. deploy the release commit to `us-east-0` and verify that the service remains
+   active with working RPC and no restarts for the settle window
+4. build and verify assets before tag creation
+5. wait for approval of the `release` environment
+6. create the immutable tag and GitHub pre-release
+7. publish the release assets; the tag push then triggers
    `release-binaries.yml`, which publishes the Docker images
+8. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
+   `never`, the tag is a release candidate under the default `auto`, or
+   `allow_unpublishable_crate_graph` is set
 
-The documented emergency source-first mode skips the pre-tag VCT crossing and
-asset build. A handoff-canary failure in the normal path blocks release
-publication and alerts `#zakura-alerts`; investigate it rather than bypassing
-the gate.
+The start canary runs in parallel with asset staging and is not a dependency
+of the protected `release` environment, so it never delays the approval
+request. Its failure is intentionally advisory: investigate it, but
+infrastructure or fleet reliability issues do not block release publication.
+A canary failure restores `us-east-0` to the previously deployed binary before
+reporting, so the fleet is not left on an unvalidated build; if the rollback
+itself fails the run says so explicitly and the node needs manual recovery.
+
+The documented emergency source-first mode skips the pre-tag VCT crossing,
+start canary, and asset build. The independently dispatched handoff canary
+also remains advisory and alerts `#zakura-alerts` on failure.
 
 Before a Mode A hotfix from an older release line, confirm the PR-node assets
 include a database-compatible snapshot below that branch's checkpoint. If
@@ -253,8 +273,12 @@ still has the previous package version.
 - Verify release checksums.
 - Verify the standard Docker image has amd64 and arm64; verify the
   zcashd-compat image has amd64.
-- Publish only changed crates, preserving dependency order.
-- Install the exact version from crates.io and run `zakurad --version`.
+- Approve the `crates-io` deployment on the dispatched `Publish crates` run
+  after reviewing its plan table; that approval is the crates.io publish, and
+  it is irreversible. Retry a partial publish by dispatching the workflow again
+  for the same tag, never by yanking.
+- Confirm the run's `Verify the published versions` and `Install zakurad from
+  crates.io` jobs passed; they replace publishing and installing by hand.
 - Replace the boilerplate GitHub release body with concrete notes from the final
   changelog or approved release-note draft.
 - Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`

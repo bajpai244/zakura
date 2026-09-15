@@ -38,11 +38,12 @@ use crate::{
     BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
 };
 
+use super::trace::BlockBodySource;
 use super::{
-    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, RequestResponseService,
-    Service as ZakuraService, ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId,
-    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
+    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
+    RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
+    SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle,
+    ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
@@ -114,6 +115,9 @@ const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Reserve half of each connection's stream-open budget for native ordered
+/// streams, reconnects, and other request clients.
+const LEGACY_REQUEST_STREAM_RATE_DIVISOR: u32 = 2;
 /// How long the dual-stack tries the (buffered) legacy peer set for an inventory
 /// fetch before falling back to Zakura. Without this bound, a node that upgraded
 /// all its peers to Zakura (and so has no ready legacy peer) would block every
@@ -139,17 +143,13 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_GOSSIP,
         version: LEGACY_GOSSIP_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::Ordered,
+        mode: StreamMode::Persistent,
     },
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
         version: LEGACY_GOSSIP_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
         mode: StreamMode::RequestResponse,
@@ -366,7 +366,7 @@ impl LegacyRequestFrame {
             Self::PushTransaction(transaction) => Ok(Frame {
                 message_type: MSG_REQUEST_PUSH_TRANSACTION,
                 flags: 0,
-                payload: transaction.transaction.zcash_serialize_to_vec()?,
+                payload: transaction.transaction().zcash_serialize_to_vec()?,
             }),
         }
     }
@@ -549,7 +549,7 @@ impl LegacyResponseCodec {
                                 request_id,
                                 max_frame_bytes,
                                 max_message_bytes,
-                                transaction.transaction.zcash_serialize_to_vec()?,
+                                transaction.transaction().zcash_serialize_to_vec()?,
                             )?;
                         }
                         InventoryResponse::Missing(id) => missing.push(id),
@@ -748,7 +748,13 @@ impl LegacyResponseCodec {
         reassembler.finish()?;
 
         match request_kind {
+            LegacyRequestKind::Blocks if blocks.is_empty() => {
+                Err(LegacyGossipError::MissingResponse(request_kind.command()))
+            }
             LegacyRequestKind::Blocks => Ok(Response::Blocks(blocks)),
+            LegacyRequestKind::Transactions if transactions.is_empty() => {
+                Err(LegacyGossipError::MissingResponse(request_kind.command()))
+            }
             LegacyRequestKind::Transactions => Ok(Response::Transactions(transactions)),
             LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes(block_hashes)),
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
@@ -1739,6 +1745,20 @@ impl LegacyRequestAdapter {
         }
     }
 
+    fn new_with_trace_and_stream_rate(
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
+    ) -> Self {
+        Self {
+            client: ZakuraRequestClient::new_with_trace_and_stream_rate(
+                supervisor,
+                trace,
+                stream_open_rate_per_second,
+            ),
+        }
+    }
+
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
         Self {
@@ -1824,6 +1844,7 @@ pub(crate) struct ZakuraDualStackService<L> {
     gossip: LegacyGossipAdapter,
     request: LegacyRequestAdapter,
     legacy_enabled: bool,
+    trace: ZakuraTrace,
 }
 
 impl<L> ZakuraDualStackService<L> {
@@ -1833,11 +1854,13 @@ impl<L> ZakuraDualStackService<L> {
     /// shared with the inbound sink.
     #[cfg(test)]
     pub(crate) fn new(legacy: L, supervisor: ZakuraSupervisorHandle, legacy_enabled: bool) -> Self {
+        let trace = ZakuraTrace::noop();
         Self {
             legacy,
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
-            request: LegacyRequestAdapter::new(supervisor),
+            request: LegacyRequestAdapter::new_with_trace(supervisor, trace.clone()),
             legacy_enabled,
+            trace,
         }
     }
 
@@ -1847,12 +1870,18 @@ impl<L> ZakuraDualStackService<L> {
         supervisor: ZakuraSupervisorHandle,
         legacy_enabled: bool,
         trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
     ) -> Self {
         Self {
             legacy,
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
-            request: LegacyRequestAdapter::new_with_trace(supervisor, trace),
+            request: LegacyRequestAdapter::new_with_trace_and_stream_rate(
+                supervisor,
+                trace.clone(),
+                stream_open_rate_per_second,
+            ),
             legacy_enabled,
+            trace,
         }
     }
 }
@@ -1892,11 +1921,27 @@ where
         };
 
         let legacy_enabled = self.legacy_enabled;
+        let requested_block_hashes = match &request {
+            Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
+                Some(hashes.clone())
+            }
+            _ => None,
+        };
         let mut gossip = self.gossip.clone();
         let mut request_adapter = self.request.clone();
         let mut legacy = self.legacy.clone();
+        let trace = self.trace.clone();
 
         Box::pin(async move {
+            let record_source = |response, source| {
+                record_block_response_source(
+                    &trace,
+                    response,
+                    source,
+                    requested_block_hashes.as_ref(),
+                )
+            };
+
             match route {
                 DualStackRoute::Advertise => {
                     // Fan out concurrently so a slow/empty Zakura path can't delay
@@ -1924,10 +1969,16 @@ where
                 }
                 DualStackRoute::LegacyFirstThenZakura => {
                     if matches!(request.inventory_source(), Some(PeerSource::Zakura(_))) {
-                        return request_adapter.call(request).await;
+                        return request_adapter
+                            .call(request)
+                            .await
+                            .map(|response| record_source(response, BlockBodySource::Zakura));
                     }
                     if !legacy_enabled {
-                        return request_adapter.call(request).await;
+                        return request_adapter
+                            .call(request)
+                            .await
+                            .map(|response| record_source(response, BlockBodySource::Zakura));
                     }
                     // The legacy peer set is buffered, so it queues this fetch
                     // even when it has no ready peer (e.g. every legacy peer was
@@ -1938,17 +1989,24 @@ where
                     })
                     .await;
                     match legacy_attempt {
-                        Ok(Ok(response)) if !all_inventory_missing(&response) => Ok(response),
+                        Ok(Ok(response)) if !all_inventory_missing(&response) => {
+                            Ok(record_source(response, BlockBodySource::Legacy))
+                        }
                         Ok(Ok(response)) => match request_adapter.call(request).await {
-                            Ok(zakura) if !all_inventory_missing(&zakura) => Ok(zakura),
+                            Ok(zakura) if !all_inventory_missing(&zakura) => {
+                                Ok(record_source(zakura, BlockBodySource::Zakura))
+                            }
                             _ => Ok(response),
                         },
                         Ok(Err(legacy_error)) => match request_adapter.call(request).await {
-                            Ok(zakura) => Ok(zakura),
+                            Ok(zakura) => Ok(record_source(zakura, BlockBodySource::Zakura)),
                             Err(_) => Err(legacy_error),
                         },
                         // Legacy timed out (no ready peer): use Zakura.
-                        Err(_) => request_adapter.call(request).await,
+                        Err(_) => request_adapter
+                            .call(request)
+                            .await
+                            .map(|response| record_source(response, BlockBodySource::Zakura)),
                     }
                 }
                 DualStackRoute::Passthrough => legacy.ready().await?.call(request).await,
@@ -1957,12 +2015,36 @@ where
     }
 }
 
+fn record_block_response_source(
+    trace: &ZakuraTrace,
+    response: Response,
+    source: BlockBodySource,
+    requested_hashes: Option<&HashSet<block::Hash>>,
+) -> Response {
+    if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
+        for block in blocks {
+            match block {
+                InventoryResponse::Available((block, _))
+                    if requested_hashes.contains(&block.hash()) =>
+                {
+                    trace.record_block_body_received(block.hash(), source);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    response
+}
+
 /// Outbound Zakura inventory request client.
 #[derive(Clone, Debug)]
 pub struct ZakuraRequestClient {
     supervisor: ZakuraSupervisorHandle,
     request_timeout: Duration,
     trace: ZakuraTrace,
+    request_interval: Duration,
+    next_request_at: Arc<Mutex<Instant>>,
 }
 
 impl ZakuraRequestClient {
@@ -1973,20 +2055,47 @@ impl ZakuraRequestClient {
 
     /// Create a client from a Zakura supervisor and trace emitter.
     pub fn new_with_trace(supervisor: ZakuraSupervisorHandle, trace: ZakuraTrace) -> Self {
+        Self::new_with_trace_and_stream_rate(
+            supervisor,
+            trace,
+            super::DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
+        )
+    }
+
+    fn new_with_trace_and_stream_rate(
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
+    ) -> Self {
+        let request_rate = legacy_request_stream_rate(stream_open_rate_per_second);
+        let interval_nanos = 1_000_000_000u64
+            .checked_div(u64::from(request_rate))
+            .unwrap_or(1)
+            .max(1);
         Self {
             supervisor,
             request_timeout: LEGACY_REQUEST_TIMEOUT,
             trace,
+            request_interval: Duration::from_nanos(interval_nanos),
+            next_request_at: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
-        Self {
-            supervisor,
-            request_timeout,
-            trace: ZakuraTrace::noop(),
-        }
+        let mut client = Self::new(supervisor);
+        client.request_timeout = request_timeout;
+        client
+    }
+
+    async fn wait_for_request_slot(&self) {
+        let request_at = {
+            let mut next_request_at = self.next_request_at.lock().await;
+            let request_at = (*next_request_at).max(Instant::now());
+            *next_request_at = request_at + self.request_interval;
+            request_at
+        };
+        tokio::time::sleep_until(request_at).await;
     }
 
     async fn request(
@@ -2080,6 +2189,7 @@ impl ZakuraRequestClient {
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
+        self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested block hashes (if any) before consuming the frame,
         // so the response can be bound to a hash we actually asked for.
@@ -2176,6 +2286,12 @@ impl ZakuraRequestClient {
         });
         Ok(response)
     }
+}
+
+fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
+    stream_open_rate_per_second
+        .max(1)
+        .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
 }
 
 fn select_handle(
@@ -2428,9 +2544,9 @@ impl ZakuraService for LegacyGossipSink {
         legacy_gossip_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::InitiatorOnly,
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::InitiatorOnly,
             reopen: true,
         }
     }
@@ -2444,17 +2560,17 @@ impl ZakuraService for LegacyGossipSink {
         self.outbound.owns_connection(peer, conn_id)
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         _direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if self.outbound.is_retired(peer, conn_id) {
-            return OrderedSessionDemand::Retire;
+            return SessionDemand::Retire;
         }
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn add_peer(&self, mut peer: Peer) {
@@ -3174,7 +3290,7 @@ mod tests {
                     Response::Transactions(
                         ids.into_iter()
                             .map(|id| {
-                                if id == self.transaction.id {
+                                if id == self.transaction.id() {
                                     InventoryResponse::Available((self.transaction.clone(), None))
                                 } else {
                                     InventoryResponse::Missing(id)
@@ -3350,7 +3466,7 @@ mod tests {
                     Response::Transactions(
                         ids.into_iter()
                             .map(|id| match &self.transaction {
-                                Some(transaction) if id == transaction.id => {
+                                Some(transaction) if id == transaction.id() => {
                                     InventoryResponse::Available((transaction.clone(), None))
                                 }
                                 _ => InventoryResponse::Missing(id),
@@ -3398,7 +3514,7 @@ mod tests {
                 Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
                 Request::FindHeaders { .. } => Response::BlockHeaders(vec![self.header()]),
                 Request::MempoolTransactionIds => {
-                    Response::TransactionIds(vec![self.transaction.id])
+                    Response::TransactionIds(vec![self.transaction.id()])
                 }
                 Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                     Response::Blocks(
@@ -3415,7 +3531,7 @@ mod tests {
                     )
                 }
                 Request::PushTransaction(transaction, _) => {
-                    if let Err(error) = self.pushed_tx.send(transaction.id) {
+                    if let Err(error) = self.pushed_tx.send(transaction.id()) {
                         return std::future::ready(Err(Box::new(error)));
                     }
                     Response::Nil
@@ -3525,7 +3641,7 @@ mod tests {
 
     async fn node_peer_id(node: &ZakuraTestNode) -> Result<ZakuraPeerId, BoxError> {
         Ok(ZakuraPeerId::new(
-            node.node_addr().await.node_id.as_bytes().to_vec(),
+            node.node_addr().await.id.as_bytes().to_vec(),
         )?)
     }
 
@@ -3581,6 +3697,7 @@ mod tests {
         let (service_send, _peer_recv) = framed_channel(8);
         let stream = ServiceStream::new(
             session_id,
+            LEGACY_GOSSIP_VERSION,
             service_recv,
             service_send,
             cancel_token.child_token(),
@@ -3616,16 +3733,26 @@ mod tests {
     }
 
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
-        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+        let result = tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
-                if node.supervisor().registered_ids().await.len() == count {
+                let observed = node.supervisor().registered_ids().await.len();
+                if observed == count {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+        .await;
+
+        if result.is_err() {
+            let observed = node.supervisor().registered_ids().await.len();
+            return Err(format!(
+                "timed out waiting for {count} peer registrations; observed {observed}"
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Regression for `claude-legacy-request-orphaned-handler-permits`.
@@ -3819,7 +3946,7 @@ mod tests {
     async fn request_adapter_fetches_available_and_missing_transactions() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(2));
-        let available_id = transaction.id;
+        let available_id = transaction.id();
         let missing_id = witnessed_tx_id(99);
         let node_a = inventory_node(63, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(64).spawn().await?;
@@ -3840,7 +3967,7 @@ mod tests {
         assert!(transactions.iter().any(|response| {
             matches!(
                 response,
-                InventoryResponse::Available((tx, None)) if tx.id == transaction.id
+                InventoryResponse::Available((tx, None)) if tx.id() == transaction.id()
             )
         }));
         assert!(transactions.iter().any(
@@ -3944,6 +4071,8 @@ mod tests {
         wait_registered_count(&node_c, 2).await?;
 
         let a_peer_id = node_peer_id(&node_a).await?;
+        let b_peer_id = node_peer_id(&node_b).await?;
+        let c_peer_id = node_peer_id(&node_c).await?;
         let mut gossip = LegacyGossipAdapter::new(node_a.supervisor());
         gossip
             .ready()
@@ -3954,13 +4083,15 @@ mod tests {
         match recv_request(&mut rx_b).await? {
             Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block.hash());
-                assert_eq!(peer_id, a_peer_id);
+                // C may forward the announcement before the direct A-to-B stream arrives.
+                assert!(peer_id == a_peer_id || peer_id == c_peer_id);
             }
             request => panic!("unexpected B request: {request:?}"),
         }
         match recv_request(&mut rx_c).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(_))) => {
+            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block.hash());
+                assert!(peer_id == a_peer_id || peer_id == b_peer_id);
             }
             request => panic!("unexpected C request: {request:?}"),
         }
@@ -4034,7 +4165,7 @@ mod tests {
         )?);
         let transaction = UnminedTx::from(empty_v5_transaction(5));
         let pushed_transaction = UnminedTx::from(empty_v5_transaction(6));
-        let pushed_id = pushed_transaction.id;
+        let pushed_id = pushed_transaction.id();
         let (node_a, mut pushed_rx) = normal_network_node(83, block, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(84).spawn().await?;
         node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
@@ -4047,7 +4178,7 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        assert_eq!(mempool, Response::TransactionIds(vec![transaction.id]));
+        assert_eq!(mempool, Response::TransactionIds(vec![transaction.id()]));
 
         let ping = adapter
             .request_from_source(
@@ -4179,7 +4310,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(3));
-        let txid = transaction.id;
+        let txid = transaction.id();
         let (advertiser, mut advertiser_rx) = recording_inventory_node(65, None).await?;
         let (fallback, mut fallback_rx) =
             recording_inventory_node(66, Some(transaction.clone())).await?;
@@ -4223,7 +4354,7 @@ mod tests {
         };
         assert!(matches!(
             transactions.as_slice(),
-            [InventoryResponse::Available((tx, None))] if tx.id == transaction.id
+            [InventoryResponse::Available((tx, None))] if tx.id() == transaction.id()
         ));
 
         advertiser.shutdown().await;
@@ -4573,8 +4704,8 @@ mod tests {
             "a retired gossip stream must not hold a reopen-gap claim"
         );
         assert!(matches!(
-            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
-            OrderedSessionDemand::Retire,
+            sink.session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            SessionDemand::Retire,
         ));
         let (send, _rx) = framed_channel(1);
         assert!(
@@ -4636,8 +4767,8 @@ mod tests {
             "a reset churn counter must keep the reopen-gap claim"
         );
         assert!(matches!(
-            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
-            OrderedSessionDemand::OpenNow,
+            sink.session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            SessionDemand::OpenNow,
         ));
     }
 
@@ -4966,6 +5097,47 @@ mod tests {
             ),
             Err(LegacyGossipError::OversizedResponse(_))
         ));
+    }
+
+    #[test]
+    fn response_codec_rejects_empty_inventory_frame_sets() {
+        for kind in [LegacyRequestKind::Blocks, LegacyRequestKind::Transactions] {
+            assert!(matches!(
+                LegacyResponseCodec::decode_response(1, kind, Vec::new(), None),
+                Err(LegacyGossipError::MissingResponse(_))
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_client_paces_stream_opens_below_the_connection_limit() {
+        let client = ZakuraRequestClient::new_with_trace_and_stream_rate(
+            ZakuraSupervisorHandle::new(1),
+            ZakuraTrace::noop(),
+            4,
+        );
+        let started = Instant::now();
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now(),
+            started,
+            "the first request uses the open slot"
+        );
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_millis(500),
+            "compatibility requests use half the configured stream-open rate"
+        );
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_secs(1),
+            "successive request slots stay evenly spaced"
+        );
     }
 
     /// The inbound service returns `Response::Nil` (a lone nil frame) for an empty
@@ -5729,8 +5901,6 @@ mod tests {
     enum StubInventory {
         /// Return every requested id as missing (triggers Zakura fallback).
         Missing,
-        /// Return the given transaction as available.
-        Available(UnminedTx),
         /// Error on inventory (used to prove the legacy path is bypassed).
         Error,
     }
@@ -5762,17 +5932,6 @@ mod tests {
                         }
                         StubInventory::Missing => Response::Transactions(
                             ids.into_iter().map(InventoryResponse::Missing).collect(),
-                        ),
-                        StubInventory::Available(tx) => Response::Transactions(
-                            ids.into_iter()
-                                .map(|id| {
-                                    if id == tx.id {
-                                        InventoryResponse::Available((tx.clone(), None))
-                                    } else {
-                                        InventoryResponse::Missing(id)
-                                    }
-                                })
-                                .collect(),
                         ),
                     }
                 }
@@ -5837,35 +5996,44 @@ mod tests {
     async fn dual_stack_inventory_falls_back_to_zakura_when_legacy_missing() -> Result<(), BoxError>
     {
         let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
         let transaction = UnminedTx::from(empty_v5_transaction(7));
-        let advertiser = inventory_node(203, transaction.clone()).await?;
+        let (advertiser, _pushed_rx) = normal_network_node(203, block, transaction).await?;
         let requester = ZakuraTestNode::builder(204).spawn().await?;
         requester
             .connect_native(&advertiser, TEST_NET_TIMEOUT)
             .await?;
 
         let (legacy_tx, _rx_legacy) = tokio::sync::mpsc::unbounded_channel();
-        let mut composite = ZakuraDualStackService::new(
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
             DualStackLegacyStub {
                 tx: legacy_tx,
                 inventory: StubInventory::Missing,
             },
             requester.supervisor(),
             true,
+            trace.clone(),
+            1,
         );
 
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::BlocksByHash(HashSet::from([hash])))
             .await?;
-        match response {
-            Response::Transactions(items) => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], InventoryResponse::Available(_)));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Zakura)
+        );
 
         advertiser.shutdown().await;
         requester.shutdown().await;
@@ -5875,34 +6043,60 @@ mod tests {
     #[tokio::test]
     async fn dual_stack_inventory_uses_legacy_when_available() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
-        let transaction = UnminedTx::from(empty_v5_transaction(8));
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
         // No Zakura advertiser is connected, so any fallback would fail; the
         // legacy-available short-circuit is what makes this succeed.
         let requester = ZakuraTestNode::builder(205).spawn().await?;
 
-        let (legacy_tx, _rx_legacy) = tokio::sync::mpsc::unbounded_channel();
-        let mut composite = ZakuraDualStackService::new(
-            DualStackLegacyStub {
-                tx: legacy_tx,
-                inventory: StubInventory::Available(transaction.clone()),
-            },
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
+            BlockInventoryResponder { block },
             requester.supervisor(),
             true,
+            trace.clone(),
+            1,
         );
 
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::BlocksByHash(HashSet::from([hash])))
             .await?;
-        match response {
-            Response::Transactions(items) => {
-                assert!(matches!(items[0], InventoryResponse::Available(_)));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Legacy)
+        );
 
         requester.shutdown().await;
+        Ok(())
+    }
+
+    #[test]
+    fn block_source_ignores_unrequested_body() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let received_hash = block.hash();
+        let requested_hashes = HashSet::from([block_hash(250)]);
+        assert!(!requested_hashes.contains(&received_hash));
+        let trace = ZakuraTrace::noop();
+
+        record_block_response_source(
+            &trace,
+            Response::Blocks(vec![InventoryResponse::Available((block, None))]),
+            BlockBodySource::Legacy,
+            Some(&requested_hashes),
+        );
+
+        assert_eq!(trace.first_block_body_source(received_hash), None);
         Ok(())
     }
 
@@ -5930,7 +6124,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -6007,7 +6201,7 @@ mod tests {
             .call(Request::MempoolTransactionIds)
             .await?;
         assert!(
-            matches!(mempool_ids, Response::TransactionIds(ref ids) if *ids == vec![transaction.id]),
+            matches!(mempool_ids, Response::TransactionIds(ref ids) if *ids == vec![transaction.id()]),
             "MempoolTransactionIds should be served over Zakura, got {mempool_ids:?}",
         );
 
@@ -6020,7 +6214,7 @@ mod tests {
             .recv()
             .await
             .expect("transaction pushed over Zakura");
-        assert_eq!(pushed, transaction.id);
+        assert_eq!(pushed, transaction.id());
 
         // None of these requests consulted the legacy peer set.
         assert!(

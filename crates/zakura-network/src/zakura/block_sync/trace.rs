@@ -160,6 +160,8 @@ pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub returned_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub already_pending_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub released_count: Option<u64>,
@@ -357,36 +359,6 @@ impl QueueSendFailedEvent {
         )
     }
 
-    /// Peer routines historically projected range fields only for GetBlocks.
-    pub(super) fn peer_routine(
-        peer: &ZakuraPeerId,
-        message: &BlockSyncMessage,
-        error: &OrderedSendError,
-        queue_capacity: usize,
-        queue_max_capacity: usize,
-    ) -> Self {
-        let message_fields = match message {
-            BlockSyncMessage::GetBlocks {
-                start_height,
-                count,
-            } => MessageFields {
-                range_start: Some(height(*start_height)),
-                range_count: Some(u64::from(*count)),
-                ..MessageFields::default()
-            },
-            _ => MessageFields::default(),
-        };
-        Self::build(
-            peer,
-            message,
-            error,
-            None,
-            queue_capacity,
-            queue_max_capacity,
-            message_fields,
-        )
-    }
-
     fn build(
         peer: &ZakuraPeerId,
         message: &BlockSyncMessage,
@@ -487,18 +459,22 @@ enum BlockEventDetail {
     PeerDisconnected {
         peer: String,
     },
+    #[cfg(any(test, feature = "proptest-impl"))]
     HeaderTipChanged {
         height: u64,
         hash: String,
     },
+    #[cfg(any(test, feature = "proptest-impl"))]
     StateFrontiersChanged {
         verified_block_tip: u64,
         hash: String,
     },
+    #[cfg(any(test, feature = "proptest-impl"))]
     ChainTipGrow {
         verified_block_tip: u64,
         hash: String,
     },
+    #[cfg(any(test, feature = "proptest-impl"))]
     ChainTipReset {
         verified_block_tip: u64,
         hash: String,
@@ -507,6 +483,9 @@ enum BlockEventDetail {
         range_count: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         range_start: Option<u64>,
+    },
+    RetryBodyAvailability {
+        hash: String,
     },
     BlockApplyFinished {
         apply_token: u64,
@@ -539,26 +518,40 @@ impl BlockEventReceived {
             BlockSyncEvent::PeerDisconnected(peer) => BlockEventDetail::PeerDisconnected {
                 peer: peer_label(peer),
             },
+            BlockSyncEvent::RetryBodyAvailability { hash: body_hash } => {
+                BlockEventDetail::RetryBodyAvailability {
+                    hash: hash(*body_hash),
+                }
+            }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height: h, hash: v } => {
                 BlockEventDetail::HeaderTipChanged {
                     height: height(*h),
                     hash: hash(*v),
                 }
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::StateFrontiersChanged(frontiers) => {
                 BlockEventDetail::StateFrontiersChanged {
                     verified_block_tip: height(frontiers.verified_block_tip),
                     hash: hash(frontiers.verified_block_hash),
                 }
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipGrow(frontiers) => BlockEventDetail::ChainTipGrow {
                 verified_block_tip: height(frontiers.verified_block_tip),
                 hash: hash(frontiers.verified_block_hash),
             },
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipReset(frontiers) => BlockEventDetail::ChainTipReset {
                 verified_block_tip: height(frontiers.verified_block_tip),
                 hash: hash(frontiers.verified_block_hash),
             },
+            BlockSyncEvent::ScopedNeededBlocks { blocks, .. } => BlockEventDetail::NeededBlocks {
+                range_count: saturating_usize(blocks.len()),
+                range_start: blocks.first().map(|block| height(block.height)),
+            },
+            #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => BlockEventDetail::NeededBlocks {
                 range_count: saturating_usize(blocks.len()),
                 range_start: blocks.first().map(|block| height(block.height)),
@@ -567,20 +560,14 @@ impl BlockEventReceived {
                 token,
                 height: h,
                 hash: event_hash,
-                result,
-                local_frontier,
+                outcome,
+                ..
             } => BlockEventDetail::BlockApplyFinished {
                 apply_token: *token,
                 height: height(*h),
-                hash: hash(
-                    local_frontier
-                        .as_ref()
-                        .map_or(*event_hash, |frontier| frontier.verified_block_hash),
-                ),
-                result: block_apply_result_label(*result),
-                verified_block_tip: local_frontier
-                    .as_ref()
-                    .map(|frontier| height(frontier.verified_block_tip)),
+                hash: hash(*event_hash),
+                result: block_apply_result_label(outcome.result()),
+                verified_block_tip: None,
             },
             BlockSyncEvent::BlockRangeResponseFinished {
                 peer,
@@ -646,6 +633,10 @@ enum BlockActionDetail {
         peer: String,
         reason: &'static str,
     },
+    RecordBodyUnavailable {},
+    RecordBodyInvalid {},
+    RestartBodyAvailability {},
+    RetryBodyAvailability {},
 }
 
 impl BlockActionDispatched {
@@ -655,6 +646,7 @@ impl BlockActionDispatched {
                 from,
                 limit,
                 best_header_tip,
+                ..
             } => BlockActionDetail::QueryNeededBlocks {
                 range_start: height(*from),
                 range_count: u64::from(*limit),
@@ -667,15 +659,25 @@ impl BlockActionDispatched {
                     range_count: u64::from(*count),
                 }
             }
-            BlockSyncAction::SubmitBlock { token, block } => BlockActionDetail::SubmitBlock {
+            BlockSyncAction::SubmitBlock { token, block, .. } => BlockActionDetail::SubmitBlock {
                 apply_token: *token,
                 hash: hash(block.hash()),
                 height: block.coinbase_height().map(height),
             },
             BlockSyncAction::Misbehavior { peer, reason } => BlockActionDetail::Misbehavior {
                 peer: peer_label(peer),
-                reason: block_misbehavior_label(*reason),
+                reason: block_misbehavior_label(reason),
             },
+            BlockSyncAction::RecordBodyUnavailable { .. } => {
+                BlockActionDetail::RecordBodyUnavailable {}
+            }
+            BlockSyncAction::RecordBodyInvalid { .. } => BlockActionDetail::RecordBodyInvalid {},
+            BlockSyncAction::RestartBodyAvailability { .. } => {
+                BlockActionDetail::RestartBodyAvailability {}
+            }
+            BlockSyncAction::RetryBodyAvailability { .. } => {
+                BlockActionDetail::RetryBodyAvailability {}
+            }
         };
         Self {
             event: "block_action_dispatched",
@@ -703,16 +705,19 @@ pub(super) fn block_apply_result_label(result: BlockApplyResult) -> &'static str
         BlockApplyResult::Committed => "committed",
         BlockApplyResult::Duplicate => "duplicate",
         BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::Unavailable => "unavailable",
         BlockApplyResult::TimedOut => "timed_out",
     }
 }
 
-fn block_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
+fn block_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
         BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
         BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
+        BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
+        BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
         BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
         BlockSyncMisbehavior::InvalidStatus => "invalid_status",

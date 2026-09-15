@@ -42,7 +42,7 @@ use pin_project::{pin_project, pinned_drop};
 use thiserror::Error;
 use tokio::{sync::oneshot, task::JoinHandle};
 use tower::{Service, ServiceExt};
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     block::Height,
@@ -164,6 +164,7 @@ pub enum TransactionDownloadVerifyError {
     Invalid {
         error: zakura_consensus::error::TransactionError,
         advertiser_addr: Option<PeerSocketAddr>,
+        tip_height: Option<Height>,
     },
 }
 
@@ -176,7 +177,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     // Services
@@ -187,7 +191,7 @@ where
     /// A service that verifies downloaded transactions.
     verifier: ZV,
 
-    /// A service that manages cached blockchain state.
+    /// A service that reads cached blockchain state.
     state: ZS,
 
     /// Whether legacy peer address labels in logs are unredacted.
@@ -243,7 +247,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     type Item = Result<
@@ -274,7 +281,7 @@ where
             let result = join_result.expect("transaction download and verify tasks must not panic");
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
-                    let hash = tx.transaction.id;
+                    let hash = tx.transaction.id();
                     (
                         Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
                         Some(hash),
@@ -321,7 +328,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     /// Initialize a new download stream with the provided services.
@@ -443,9 +453,9 @@ where
 
             trace!(?txid, "transaction is not in best chain");
 
-            let (tip_height, next_height) = match state.oneshot(zs::Request::Tip).await {
-                Ok(zs::Response::Tip(None)) => Ok((None, Height(0))),
-                Ok(zs::Response::Tip(Some((height, _hash)))) => {
+            let (tip_height, next_height) = match state.oneshot(zs::ReadRequest::Tip).await {
+                Ok(zs::ReadResponse::Tip(None)) => Ok((None, Height(0))),
+                Ok(zs::ReadResponse::Tip(Some((height, _hash)))) => {
                     let next_height =
                         (height + 1).expect("valid heights are far below the maximum");
                     Ok((Some(height), next_height))
@@ -492,7 +502,7 @@ where
 
                     metrics::counter!(
                         "mempool.downloaded.transactions.total",
-                        "version" => format!("{}",tx.transaction.version()),
+                        "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
                     Self::check_transaction_size(&tx, max_transaction_bytes)?;
                     (tx, advertiser_addr)
@@ -500,7 +510,7 @@ where
                 Gossip::Tx(tx) => {
                     metrics::counter!(
                         "mempool.pushed.transactions.total",
-                        "version" => format!("{}",tx.transaction.version()),
+                        "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
                     (tx, pushed_advertiser_addr)
                 }
@@ -525,12 +535,12 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr } )
+            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height } )
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(
                 "mempool.verified.transactions.total",
-                "version" => format!("{}", tx.transaction.transaction.version()),
+                "version" => format!("{}", tx.transaction.transaction().version()),
             ).increment(1);
             (tx, spent_mempool_outpoints, tip_height)
         })
@@ -683,11 +693,11 @@ where
         max_transaction_bytes: u64,
     ) -> Result<(), TransactionDownloadVerifyError> {
         if usize::try_from(max_transaction_bytes)
-            .is_ok_and(|max_transaction_bytes| transaction.size > max_transaction_bytes)
+            .is_ok_and(|max_transaction_bytes| transaction.size() > max_transaction_bytes)
         {
             return Err(TransactionDownloadVerifyError::PolicyRejected(
                 NonStandardTransactionError::TransactionTooLarge {
-                    actual_bytes: transaction.size,
+                    actual_bytes: transaction.size(),
                     max_bytes: max_transaction_bytes,
                 },
             ));
@@ -706,11 +716,13 @@ where
             .await
             .map_err(CloneError::from)
             .map_err(TransactionDownloadVerifyError::StateError)?
-            .call(zs::Request::Transaction(txid.mined_id()))
+            .call(zs::ReadRequest::Transaction(txid.mined_id()))
             .await
         {
-            Ok(zs::Response::Transaction(None)) => Ok(()),
-            Ok(zs::Response::Transaction(Some(_))) => Err(TransactionDownloadVerifyError::InState),
+            Ok(zs::ReadResponse::Transaction(None)) => Ok(()),
+            Ok(zs::ReadResponse::Transaction(Some(_))) => {
+                Err(TransactionDownloadVerifyError::InState)
+            }
             Ok(_) => unreachable!("wrong response"),
             Err(e) => Err(TransactionDownloadVerifyError::StateError(e.into())),
         }?;
@@ -726,7 +738,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     fn drop(mut self: Pin<&mut Self>) {
@@ -751,7 +766,7 @@ mod tests {
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<tx::Request, tx::Response, BoxError>;
-    type PendingState = BoxCloneService<zs::Request, zs::Response, BoxError>;
+    type PendingState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, BoxError>;
 
     fn tx_id(index: u64) -> UnminedTxId {
         let mut bytes = [0; 32];
@@ -786,7 +801,7 @@ mod tests {
                 future::pending::<Result<tx::Response, BoxError>>()
             })),
             BoxCloneService::new(service_fn(|_request| {
-                future::pending::<Result<zs::Response, BoxError>>()
+                future::pending::<Result<zs::ReadResponse, BoxError>>()
             })),
             false,
             u64::MAX,
@@ -852,8 +867,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -902,8 +917,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -932,7 +947,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_transaction_at_size_limit_is_verified() {
         let transaction = empty_v5_transaction(1);
-        let max_transaction_bytes = u64::try_from(transaction.size)
+        let max_transaction_bytes = u64::try_from(transaction.size())
             .expect("serialized transaction sizes fit in u64 on supported platforms");
         let verifier_calls = Arc::new(AtomicUsize::new(0));
         let verifier_calls_for_service = verifier_calls.clone();
@@ -948,7 +963,7 @@ mod tests {
                     let tx::Request::Mempool { transaction, .. } = request else {
                         panic!("unexpected transaction verifier request: {request:?}");
                     };
-                    let miner_fee = transaction.conventional_fee;
+                    let miner_fee = transaction.conventional_fee();
                     let transaction =
                         VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
                             .expect("test transaction pays its conventional fee");
@@ -961,8 +976,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -987,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_transaction_over_size_limit_skips_state_and_verifier() {
         let transaction = empty_v5_transaction(1);
-        let actual_bytes = transaction.size;
+        let actual_bytes = transaction.size();
         let max_bytes = u64::try_from(
             actual_bytes
                 .checked_sub(1)
@@ -1067,8 +1082,8 @@ mod tests {
     #[tokio::test]
     async fn downloaded_transaction_over_size_limit_skips_verifier() {
         let transaction = empty_v5_transaction(1);
-        let txid = transaction.id;
-        let actual_bytes = transaction.size;
+        let txid = transaction.id();
+        let actual_bytes = transaction.size();
         let max_bytes = u64::try_from(
             actual_bytes
                 .checked_sub(1)
@@ -1097,8 +1112,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1153,8 +1168,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),

@@ -28,6 +28,18 @@ Copy `nodes.example.toml` to `nodes.toml` and edit. Each `[[nodes]]` entry needs
 `[defaults]` supplies fleet-wide values (service name, paths, network, ssh
 `port`); any field can be overridden per node. `nodes.toml` is gitignored.
 
+Two optional keys turn on the node's observability endpoints, which the status
+dashboard reads over its own ssh probe:
+
+- `metrics_endpoint` — renders `[metrics] endpoint_addr`, the Prometheus
+  `/metrics` exporter.
+- `health_listen_addr` — renders `[health] listen_addr`, serving `/healthy` and
+  `/ready`.
+
+Both are unauthenticated, so bind them to loopback. `zakurad` panics if either
+address is already in use, so check the port on the node before enabling one.
+Neither is rendered on a fleet running `manage_config = false`.
+
 ## Commands
 
 ```bash
@@ -85,12 +97,20 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `ref` — branch, tag, or SHA to build and deploy, default `main`.
 - `force_rebuild` — pass `--force` to rebuild the cached binary.
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
+- `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
+  `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `header_sync_trace` — write structured canary traces under
+  `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
+
+Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
+explicit `node`, preventing canary settings from being applied fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
 while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`.
-It also writes `/etc/zakura/zakura.toml` and uses each node's existing
+Explicit per-node overrides remain available for staged experiments. The
+workflow also writes `/etc/zakura/zakura.toml` and uses each node's existing
 `/mnt/data/zakura-cache` snapshot directory, so CI restarts the current
 `zakurad.service` against the existing state instead of creating a fresh
 database. Volume-backed fleet hosts mount their attached DigitalOcean block
@@ -109,10 +129,8 @@ The workflow also refreshes a simple fleet status dashboard on
 
 The dashboard reads the generated deployer node config and polls each node over
 SSH. It shows the running commit from the node log, last restart time, current
-RPC height, whether the height advanced in the last five minutes, and an upgrade
-ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
-cluster block movement when enough samples are available, otherwise it falls back
-to `--target-spacing 7.5`.
+RPC height, and whether the height advanced in the last five minutes. Node names
+link to `/node/<name>` for per-node host vitals, sync pipeline, and peer detail.
 
 The same service exposes the narrow public website API at
 `/ironwood-status.json` and its liveness check at `/healthz`. The public response
@@ -166,9 +184,7 @@ python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --network testnet \
-  --upgrade-height 4134000 \
-  --target-spacing 7.5
+  --network testnet
 ```
 
 ## GitHub Actions mainnet fleet deploy
@@ -188,10 +204,37 @@ and deploys it to:
 - `asia-south-0` — `root@139.59.64.115`
 - `asia-pacific-0` — `root@168.144.173.250`
 - `zakura-compat` — `root@159.203.113.196`
+- `archive-vct-off` — `root@104.131.174.28`
 
 The first nine run a hand-provisioned `zakurad` systemd service.
 `zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
-same host. One-time runner bootstrap from an operator machine with SSH access
+same host. `archive-vct-off` is a legacy archive node — `vct_fast_sync = false`,
+so it never fast-synced and holds per-height commitment trees at every height.
+That is what makes it the supported generator for the release-state historical
+frontier grid, whose entries then come from reads rather than from replaying a
+fast-synced node's absent band. It is not a public bootstrap peer and is
+deliberately absent from the node ids in `zakura-network`, and it runs
+`p2p_stack = "legacy"` rather than the fleet's `dual`: on `dual` its verified body
+tip wedged roughly 6,000 blocks behind its own header chain while the v2
+coordinator logged `accepted block apply lost terminal observation; apply
+lifecycle is failed`. The fleet is binary-only, so that setting lives in the
+node's own config; flipping this host to config-managed without carrying it
+across would silently reintroduce the stall.
+
+One fleet entry buys three things, because the dashboard and the alerting both
+derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
+`nodes.ci.toml` into `/opt/zakura-mainnet-dashboard/nodes.toml`, so a node added
+here appears on the status dashboard; `zakura-cluster-watchdog.py` then reads
+that dashboard's `/data` and alerts `#zakura-alerts` when a node stays unhealthy.
+Nothing separate has to be registered for monitoring. Note that the dashboard
+step runs `if: always()` and rewrites the whole node list, so it picks up a new
+node even on a deploy scoped to one host with `--node`.
+
+A node only becomes deployable once the deployer runner can reach it. The fleet's
+deploy key is `zakura-mainnet-deployer@us-east-0`; it must be in the node's
+`~/.ssh/authorized_keys`, and the node's address must be in the workflow's
+host-key pin list. A host that is missing the key fails the deploy with
+`Permission denied (publickey)` at the scp step, after a successful build. One-time runner bootstrap from an operator machine with SSH access
 and CI credentials in `~/agents-env`:
 
 ```bash
@@ -237,20 +280,14 @@ The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
 load-balances across the mainnet `:8232` backends listed in
 `deploy/gateway/mainnet/backends.toml`.
 
-It is the same `zakura-cluster-status.py` as testnet, launched with
-`--upgrade-height 3428143` for the Ironwood mainnet activation height. The ETA
-uses observed cluster block movement when enough samples are available,
-otherwise it falls back to `--target-spacing 75` (post-Blossom mainnet spacing).
-Manual run:
+It is the same `zakura-cluster-status.py` as testnet. Manual run:
 
 ```bash
 python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --network mainnet \
-  --upgrade-height 3428143 \
-  --target-spacing 75
+  --network mainnet
 ```
 
 The mainnet workflow also installs a Slack watchdog on `us-east-0`:
@@ -270,15 +307,24 @@ when either of these conditions stays true for at least 10 minutes:
 - `health` is `down` or `rpc_error`
 - `seconds_since_advanced` is at least 600 seconds
 
-Down alerts take precedence over stalled alerts, so a node only produces one
-active alert at a time. The watchdog also alerts if a dashboard endpoint is
-unreachable for at least 10 minutes, and posts one recovery message when a node
-or dashboard recovers. Persistent failures do not post on every poll cycle.
+The watchdog waits 30 minutes and posts one fleet alert when every observable
+node shares the same height and block hash. The fleet must have at least two
+observable nodes. A missing or different block hash keeps the 10-minute node
+alerts. Down alerts take precedence over stalled alerts, so a node only produces
+one active alert at a time. The watchdog also alerts if a dashboard endpoint is
+unreachable, malformed, or serves a stale collector snapshot for at least 10
+minutes. It posts one recovery message when a node or dashboard recovers.
+Persistent failures do not post on every poll cycle.
 
 Restart deploys write a 20-minute suppression marker before touching the fleet.
 The mainnet workflow writes it locally on `us-east-0`; the testnet workflow
 refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
 in the future, new failure alerts are logged but not posted to Slack.
+
+Restart deploys that include `zakura-compat` also refresh that host's node-local
+watchdog marker and restart the active watchdog before `zakurad-compat`. This
+suppresses expected Sentry transitions and stays in the workflow so rollback
+refs whose deployer predates the marker remain covered.
 
 Manual dry run from `us-east-0`:
 

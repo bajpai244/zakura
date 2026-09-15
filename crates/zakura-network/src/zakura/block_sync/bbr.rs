@@ -1030,7 +1030,10 @@ mod bbr_tests {
         let now = Instant::now();
         for _ in 0..n {
             window.outstanding.push(OutstandingBlockRange {
+                write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
+                charged_for_liveness: true,
                 request: BlockRangeRequest {
+                    owner: super::super::test_work_owner(),
                     start_height: block::Height(0),
                     count: 1,
                     anchor_hash: block::Hash([0; 32]),
@@ -1134,7 +1137,10 @@ mod bbr_tests {
             // A `u32` index; the test count is tiny so the cast is safe.
             let height = block::Height(1 + i as u32);
             window.outstanding.push(OutstandingBlockRange {
+                write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
+                charged_for_liveness: true,
                 request: BlockRangeRequest {
+                    owner: super::super::test_work_owner(),
                     start_height: height,
                     count: 1,
                     anchor_hash: block::Hash([0; 32]),

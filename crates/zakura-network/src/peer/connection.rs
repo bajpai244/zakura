@@ -13,7 +13,7 @@ use futures::{future::Either, prelude::*};
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use tokio::time::{sleep, Sleep};
 use tower::{Service, ServiceExt};
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     block::{self, Block},
@@ -202,7 +202,7 @@ impl Handler {
                 //   - the transaction messages are sent in a single continuous batch
                 //   - missing transactions are silently skipped
                 //     (there is no `notfound` message at the end of the batch)
-                if pending_ids.remove(&transaction.id) {
+                if pending_ids.remove(&transaction.id()) {
                     // we are in the middle of the continuous transaction messages
                     transactions.push(transaction);
                 } else {
@@ -604,7 +604,7 @@ where
     #[allow(dead_code)]
     pub(super) connection_tracker: ConnectionTracker,
 
-    /// The configured log and metrics label for this peer. Usually the remote IP and port.
+    /// The configured log label for this peer. Usually the remote IP and port.
     pub(super) addr_label: String,
 
     /// The state for this peer, when the metrics were last updated.
@@ -809,7 +809,6 @@ where
                             metrics::counter!(
                                 "zakura.net.in.responses",
                                 "command" => response.command(),
-                                "addr" => self.addr_label.clone(),
                             )
                             .increment(1);
                         } else {
@@ -993,7 +992,6 @@ where
             metrics::counter!(
                 "zakura.net.out.requests.canceled",
                 "command" => request.command(),
-                "addr" => self.addr_label.clone(),
             )
             .increment(1);
             self.update_state_metrics(format!("Out::Req::Canceled::{}", request.command()));
@@ -1007,7 +1005,6 @@ where
         metrics::counter!(
             "zakura.net.out.requests",
             "command" => request.command(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("Out::Req::{}", request.command()));
@@ -1238,21 +1235,6 @@ where
                 debug!(%msg, "got headers message unsolicited or from canceled request");
                 Unused
             }
-            // These messages should never be sent by peers.
-            Message::FilterLoad { .. } | Message::FilterAdd { .. } | Message::FilterClear => {
-                // # Security
-                //
-                // Zcash connections are not authenticated, so malicious nodes can send fake messages,
-                // with connected peers' IP addresses in the IP header.
-                //
-                // Since we can't verify their source, Zebra needs to ignore unexpected messages,
-                // because closing the connection could cause a denial of service or eclipse attack.
-                debug!(%msg, "got BIP111 message without advertising NODE_BLOOM");
-
-                // Ignored, but consumed because it is technically a protocol error.
-                Consumed
-            }
-
             // # Security
             //
             // Zebra crawls the network proactively, and that's the only way peers get into our
@@ -1419,7 +1401,6 @@ where
         metrics::counter!(
             "zakura.net.in.requests",
             "command" => req.command(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("In::Req::{}", req.command()));
@@ -1456,7 +1437,9 @@ where
 
                     self.handle_inbound_overload(req, now, PeerError::Overloaded)
                         .await;
-                } else if e.is::<tower::timeout::error::Elapsed>() {
+                } else if e.is::<tower::timeout::error::Elapsed>()
+                    || e.is::<tokio::time::error::Elapsed>()
+                {
                     // # Security
                     //
                     // Peer requests must have a timeout.
@@ -1490,7 +1473,6 @@ where
         metrics::counter!(
             "zakura.net.out.responses",
             "command" => rsp.command(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("In::Rsp::{}", rsp.command()));

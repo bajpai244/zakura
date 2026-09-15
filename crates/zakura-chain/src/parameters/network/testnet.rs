@@ -1,6 +1,10 @@
 //! Types and implementation for Testnet consensus parameters
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use crate::{
     amount::{Amount, NonNegative},
@@ -9,19 +13,20 @@ use crate::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
         constants::{magics, SLOW_START_INTERVAL, SLOW_START_SHIFT},
         network::error::ParametersBuilderError,
-        network_upgrade::TESTNET_ACTIVATION_HEIGHTS,
+        network_upgrade::{TESTNET_ACTIVATION_HEIGHTS, TESTNET_MAX_TIME_START_HEIGHT},
         subsidy::{
             constants::mainnet,
             constants::testnet,
             constants::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
-                POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+                MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
             },
             funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams,
+            FundingStreams, ParameterSubsidy,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
+    serialization::SerializationError,
     transparent,
     work::difficulty::{ExpandedDifficulty, U256},
 };
@@ -229,6 +234,19 @@ impl ConfiguredFundingStreams {
         let recipients = self
             .recipients
             .map(|recipients| {
+                // Recipients are keyed by receiver, so a repeated receiver would silently
+                // replace the earlier entry, and the numerator check below would only see
+                // the last one. Reject the ambiguous configuration instead.
+                let mut seen_receivers = HashSet::new();
+                for recipient in &recipients {
+                    assert!(
+                        seen_receivers.insert(recipient.receiver),
+                        "funding stream receiver {:?} must not be configured more than once \
+                         in the same funding stream",
+                        recipient.receiver
+                    );
+                }
+
                 recipients
                     .into_iter()
                     .map(ConfiguredFundingStreamRecipient::into_recipient)
@@ -250,12 +268,17 @@ impl ConfiguredFundingStreams {
         let funding_streams = FundingStreams::new(height_range.clone(), recipients);
 
         // check that sum of receiver numerators is valid.
-
+        //
+        // The numerators are operator-supplied, so sum them with checked arithmetic: a
+        // wrapping sum can land back inside the valid range, and the check below would
+        // then accept numerators that make every block subsidy calculation fail.
         let sum_numerators: u64 = funding_streams
             .recipients()
             .values()
-            .map(|r| r.numerator())
-            .sum();
+            .try_fold(0u64, |sum, recipient| {
+                sum.checked_add(recipient.numerator())
+            })
+            .expect("sum of funding stream numerators must not overflow");
 
         assert!(
             sum_numerators <= FUNDING_STREAM_RECEIVER_DENOMINATOR,
@@ -292,7 +315,7 @@ fn num_funding_stream_addresses_required_for_height_range(
     height_range: &std::ops::Range<Height>,
     network: &Network,
 ) -> usize {
-    1u32.checked_add(funding_stream_address_period(
+    1i64.checked_add(funding_stream_address_period(
         height_range
             .end
             .previous()
@@ -301,7 +324,9 @@ fn num_funding_stream_addresses_required_for_height_range(
     ))
     .expect("no overflow should happen in this sum")
     .checked_sub(funding_stream_address_period(height_range.start, network))
-    .expect("no overflow should happen in this sub") as usize
+    .expect("no overflow should happen in this sub")
+    .try_into()
+    .expect("a funding stream height range must not have a negative number of periods")
 }
 
 /// Checks that the provided [`FundingStreams`] has sufficient recipient addresses for the
@@ -334,6 +359,127 @@ fn check_funding_stream_address_period(funding_streams: &FundingStreams, network
             );
         }
     }
+}
+
+/// Checks that every funding stream recipient address in the provided [`FundingStreams`]
+/// is a P2SH address.
+///
+/// The funding stream consensus rule only accepts P2SH outputs, so block validation
+/// panics when an expected funding stream address is any other type. Rejecting those
+/// addresses here surfaces the problem when the network is configured, rather than at
+/// the activation height of the stream.
+fn check_funding_stream_address_types(
+    funding_streams: &FundingStreams,
+) -> Result<(), ParametersBuilderError> {
+    for (&receiver, recipient) in funding_streams.recipients() {
+        if receiver == FundingStreamReceiver::Deferred {
+            // The `Deferred` receiver has no addresses, and pays no outputs.
+            continue;
+        }
+
+        for address in recipient.addresses() {
+            if !address.is_script_hash() {
+                return Err(ParametersBuilderError::FundingStreamAddressNotP2SH {
+                    receiver,
+                    address: address.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks that every configured NU6.1 one-time lockbox disbursement can be paid: each address
+/// parses and is a P2SH address, and the amounts sum to a valid amount.
+///
+/// [`Parameters::lockbox_disbursements()`] parses these addresses with an `expect`, and the
+/// disbursement consensus rule only accepts P2SH outputs, so an address that does not parse
+/// or is not P2SH crashes block validation at the NU6.1 activation height.
+/// [`Parameters::lockbox_disbursement_total_amount()`] sums the amounts with an `expect`, so
+/// a total above the money supply crashes the deferred pool balance calculation. Checking
+/// both here surfaces the problem when the network is configured.
+///
+/// The address network kind is deliberately not checked: a P2SH script is the address hash
+/// alone, so a Mainnet P2SH address and a Testnet one with the same hash pay the same script.
+fn check_lockbox_disbursements(
+    lockbox_disbursements: &[(String, Amount<NonNegative>)],
+) -> Result<(), ParametersBuilderError> {
+    let mut total = Amount::<NonNegative>::zero();
+
+    for (address, amount) in lockbox_disbursements {
+        let parsed: transparent::Address = address.parse().map_err(|err: SerializationError| {
+            ParametersBuilderError::InvalidLockboxDisbursementAddress {
+                address: address.clone(),
+                err: err.to_string(),
+            }
+        })?;
+
+        if !parsed.is_script_hash() {
+            return Err(ParametersBuilderError::LockboxDisbursementAddressNotP2SH {
+                address: address.clone(),
+            });
+        }
+
+        total = (total + *amount)
+            .map_err(|_| ParametersBuilderError::InvalidLockboxDisbursementTotal)?;
+    }
+
+    Ok(())
+}
+
+/// The divisor used to calculate the founders reward from the block subsidy.
+///
+/// The founders reward is 20% of the block subsidy, calculated with exact division.
+const FOUNDERS_REWARD_DIVISOR: u64 = 5;
+
+/// Checks that the founders reward is an exact fifth of the block subsidy at every height
+/// that pays it.
+///
+/// `founders_reward()` divides the block subsidy by five and panics on a remainder, and the
+/// slow start rate is the block subsidy limit divided by the configured slow start interval,
+/// truncated. An interval that leaves a remainder modulo five therefore crashes block
+/// validation at the first block that pays a founders reward.
+fn check_founders_reward_is_exact(network: &Network) -> Result<(), ParametersBuilderError> {
+    let slow_start_interval = network.slow_start_interval();
+
+    // The founders reward is paid below both the first halving and Canopy, and the genesis
+    // block does not pay one. If either boundary is at or below the first block, or the slow
+    // start ends there, no block uses a slow start subsidy to pay a founders reward.
+    let canopy_height = NetworkUpgrade::Canopy
+        .activation_height(network)
+        .unwrap_or(Height::MAX);
+    if slow_start_interval <= Height(1) || canopy_height <= Height(1) {
+        return Ok(());
+    }
+
+    // For a configured Testnet, `height_for_first_halving()` derives the height from the
+    // Blossom activation height and panics when the network has none, so check for Blossom
+    // first. `activation_height()` falls back to the next configured upgrade, so Blossom is
+    // only absent when every configured upgrade precedes it, which also leaves Canopy absent.
+    // `mandatory_checkpoint_height()` already panics on such a network later in
+    // `to_network()`, so this guard is unreachable today; it keeps this check from being the
+    // one that panics if that height ever becomes fallible.
+    if NetworkUpgrade::Blossom.activation_height(network).is_none()
+        || network.height_for_first_halving() <= Height(1)
+    {
+        return Ok(());
+    }
+
+    // Every slow start subsidy is a multiple of this rate, and the first block pays exactly
+    // one or two of them, so the rate itself must divide evenly by five.
+    //
+    // Subsidies above the slow start interval are the block subsidy limit, optionally divided
+    // by the Blossom spacing ratio, and both of those constants divide evenly by five.
+    let slow_start_rate = MAX_BLOCK_SUBSIDY / u64::from(slow_start_interval);
+
+    if !slow_start_rate.is_multiple_of(FOUNDERS_REWARD_DIVISOR) {
+        return Err(ParametersBuilderError::IndivisibleFoundersReward {
+            slow_start_interval,
+        });
+    }
+
+    Ok(())
 }
 
 /// Configurable activation heights for Regtest and configured Testnets.
@@ -475,6 +621,8 @@ pub struct ParametersBuilder {
     target_difficulty_limit: ExpandedDifficulty,
     /// A flag for disabling proof-of-work checks when Zebra is validating blocks
     disable_pow: bool,
+    /// Optional local activation height for the MTP-plus-90-minutes rule.
+    max_block_time_start_height: Option<Height>,
     /// Whether to allow transactions with transparent outputs to spend coinbase outputs,
     /// similar to `fCoinbaseMustBeShielded` in zcashd.
     should_allow_unshielded_coinbase_spends: bool,
@@ -514,6 +662,7 @@ impl Default for ParametersBuilder {
                 .to_expanded()
                 .expect("difficulty limits are valid expanded values"),
             disable_pow: false,
+            max_block_time_start_height: None,
             funding_streams: testnet::FUNDING_STREAMS.clone(),
             should_lock_funding_stream_address_period: false,
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
@@ -751,6 +900,12 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the local activation height for the MTP-plus-90-minutes rule.
+    pub fn with_max_block_time_start_height(mut self, height: Height) -> Self {
+        self.max_block_time_start_height = Some(height);
+        self
+    }
+
     /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
@@ -843,6 +998,12 @@ impl ParametersBuilder {
 
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
+        // The builder defaults to public Testnet consensus parameters, so an unset
+        // activation height must inherit the public Testnet soft-fork height. Regtest
+        // and other networks that want Height(2) must set it explicitly.
+        let max_block_time_start_height = self
+            .max_block_time_start_height
+            .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
             network_name,
             network_magic,
@@ -853,6 +1014,7 @@ impl ParametersBuilder {
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height: _,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -870,6 +1032,7 @@ impl ParametersBuilder {
             funding_streams,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -892,7 +1055,11 @@ impl ParametersBuilder {
         for fs in &self.funding_streams {
             // Check that the funding streams are valid for the configured Testnet parameters.
             check_funding_stream_address_period(fs, &network);
+            check_funding_stream_address_types(fs)?;
         }
+
+        check_founders_reward_is_exact(&network)?;
+        check_lockbox_disbursements(&self.lockbox_disbursements)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -907,6 +1074,9 @@ impl ParametersBuilder {
 
     /// Returns true if these [`Parameters`] should be compatible with the default Testnet parameters.
     pub fn is_compatible_with_default_parameters(&self) -> bool {
+        let max_block_time_start_height = self
+            .max_block_time_start_height
+            .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
             network_name: _,
             network_magic,
@@ -917,6 +1087,7 @@ impl ParametersBuilder {
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height: _,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -932,6 +1103,7 @@ impl ParametersBuilder {
             && self.funding_streams == funding_streams
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
+            && max_block_time_start_height == TESTNET_MAX_TIME_START_HEIGHT
             && self.should_allow_unshielded_coinbase_spends
                 == should_allow_unshielded_coinbase_spends
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
@@ -951,6 +1123,8 @@ pub struct RegtestParameters {
     pub lockbox_disbursements: Option<Vec<ConfiguredLockboxDisbursement>>,
     /// Configured checkpointed block heights and hashes.
     pub checkpoints: Option<ConfiguredCheckpoints>,
+    /// Local activation height for the MTP-plus-90-minutes rule.
+    pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
 }
@@ -985,6 +1159,8 @@ pub struct Parameters {
     target_difficulty_limit: ExpandedDifficulty,
     /// A flag for disabling proof-of-work checks when Zebra is validating blocks
     disable_pow: bool,
+    /// Activation height for the MTP-plus-90-minutes rule.
+    max_block_time_start_height: Height,
     /// Whether to allow transactions with transparent outputs to spend coinbase outputs,
     /// similar to `fCoinbaseMustBeShielded` in zcashd.
     should_allow_unshielded_coinbase_spends: bool,
@@ -1005,6 +1181,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             network_name: "Testnet".to_string(),
+            max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
             ..Self::build().finish()
         }
     }
@@ -1026,6 +1203,7 @@ impl Parameters {
             lockbox_disbursements,
             checkpoints,
             extend_funding_stream_addresses_as_required,
+            max_block_time_start_height,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1046,9 +1224,21 @@ impl Parameters {
             .with_lockbox_disbursements(lockbox_disbursements.unwrap_or_default())
             .with_checkpoints(checkpoints.unwrap_or_default())?;
 
+        // Regtest's local default is Height(2), matching zcashd-style private chains.
+        // Do not inherit the public Testnet soft-fork height from ParametersBuilder::finish().
+        parameters = parameters
+            .with_max_block_time_start_height(max_block_time_start_height.unwrap_or(Height(2)));
+
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
         }
+
+        // Regtest does not run the `to_network()` checks, so run them here: block validation
+        // panics on a funding stream or lockbox disbursement address that is not P2SH.
+        for funding_stream in &parameters.funding_streams {
+            check_funding_stream_address_types(funding_stream)?;
+        }
+        check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
 
         Ok(Self {
             network_name: "Regtest".to_string(),
@@ -1080,6 +1270,9 @@ impl Parameters {
             funding_streams: _,
             target_difficulty_limit,
             disable_pow,
+            // Maximum-time activation is a configurable local Regtest policy, not network
+            // identity.
+            max_block_time_start_height: _,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -1143,6 +1336,11 @@ impl Parameters {
     /// Returns true if proof-of-work validation should be disabled for this network
     pub fn disable_pow(&self) -> bool {
         self.disable_pow
+    }
+
+    /// Returns the local activation height for the MTP-plus-90-minutes rule.
+    pub fn max_block_time_start_height(&self) -> Height {
+        self.max_block_time_start_height
     }
 
     /// Returns true if this network should allow transactions with transparent outputs

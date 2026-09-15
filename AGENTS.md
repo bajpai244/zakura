@@ -13,6 +13,8 @@
 
 Zakura is a Rust workspace; the member crates live under `crates/` (except `deploy/zakura-watchdog`). Main crates include:
 
+`crates/zakura-assets/` is a publish-only packaging crate and is deliberately excluded from the workspace because its payload is generated and not committed.
+
 - `crates/zakurad/` (node CLI/orchestration),
 - core libraries like `crates/zakura-chain/`, `crates/zakura-consensus/`, `crates/zakura-network/`, `crates/zakura-state/`, `crates/zakura-rpc/`, `crates/zakura-script/`,
 - support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/tower-batch-control/`, `crates/tower-fallback/`, and `crates/xtask/`.
@@ -60,7 +62,7 @@ cargo nextest run --profile zakura-integration
 Zakura is a Zcash full node implementation in Rust. It is a validator node — it excludes features not strictly needed for block validation and chain sync.
 
 - **Rust edition**: 2021
-- **MSRV**: 1.91 (unified across the library crates and the zakurad binary)
+- **MSRV**: 1.97 (unified across the internal crates and the zakurad binary)
 - **Database format version**: defined in `crates/zakura-state/src/constants.rs`
 
 ## Crate Architecture

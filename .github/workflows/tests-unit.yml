@@ -1,18 +1,13 @@
 name: Unit Tests
 
 on:
+  # No `paths:` filter on pull_request: the workflow triggers on every PR and the
+  # `changes` job below gates the heavy build/test jobs so they still skip on PRs
+  # that touch no test-relevant files. This keeps the `test success` required
+  # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
-      - .config/nextest.toml
-      - .github/workflows/tests-unit.yml
 
   push:
     branches: [main]
@@ -20,11 +15,20 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
+      - .cargo/config.toml
       - .config/nextest.toml
+      - rust-toolchain.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
+      - scripts/check-crate-publish-graph.sh
+      - scripts/lib/crates-index.sh
+      - docs/specs/fork-aware-header-chain-engine.md
+      - crates/zakura-header-chain/conformance.toml
 
   # Run the full unit-test suite when a PR is queued so the merge queue validates
   # the merged result against the latest `main`. `merge_group` ignores path
@@ -41,7 +45,10 @@ on:
 # already in process, will get cancelled. Only the latest commit will be allowed
 # to run, cancelling any workflows in between
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  # PR numbers are repository-wide, unlike same-named head branches from forks.
+  # Other events use their unique run ID so different event types cannot cancel
+  # each other when they share a ref, such as push and nightly runs on `main`.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -68,6 +75,8 @@ jobs:
       pull-requests: read
     outputs:
       config: ${{ steps.filter.outputs.config }}
+      rust: ${{ steps.filter.outputs.rust }}
+      publish_graph: ${{ steps.filter.outputs.publish_graph }}
     steps:
       - id: filter
         env:
@@ -78,37 +87,59 @@ jobs:
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
+          compare_files_jq='(if (.files | length) >= 300 then ".github/workflows/tests-unit.yml" else empty end), (.files[] | .filename, (.previous_filename // empty))'
+
           case "$EVENT_NAME" in
             pull_request)
+              # The PR files endpoint returns at most 3,000 files. Run the full
+              # build and config suite when the count is missing or reaches that
+              # limit so a truncated response cannot hide a relevant path.
+              if ! [[ "$TOTAL_CHANGED_FILES" =~ ^[0-9]+$ ]] || \
+                 (( TOTAL_CHANGED_FILES >= 3000 )); then
+                echo "config=true" >> "$GITHUB_OUTPUT"
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+                echo "publish_graph=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
               changed=$(gh api --paginate \
-                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-                --jq '.[].filename')
+                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+                --jq '.[] | .filename, (.previous_filename // empty)')
               ;;
             push)
               # The first push of a branch and force-pushes that orphan the old
               # tip have no usable `before` commit. Compare against the default
-              # branch in that case.
+              # branch in that case. The compare endpoint caps its file list at
+              # 300, so the jq expression emits this workflow's own relevant
+              # path at that limit and conservatively runs the config suite.
               if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] || \
                  ! changed=$(gh api \
                    "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" \
-                   --jq '.files[].filename'); then
+                   --jq "$compare_files_jq"); then
                 changed=$(gh api \
                   "repos/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" \
-                  --jq '.files[].filename')
+                  --jq "$compare_files_jq")
               fi
               ;;
             merge_group)
               changed=$(gh api \
                 "repos/${GITHUB_REPOSITORY}/compare/${MERGE_BASE_SHA}...${MERGE_HEAD_SHA}" \
-                --jq '.files[].filename')
+                --jq "$compare_files_jq")
               ;;
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
+              echo "rust=true" >> "$GITHUB_OUTPUT"
+              echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
+              echo "rust=false" >> "$GITHUB_OUTPUT"
+              # Nightly re-checks the live index so main cannot silently
+              # accumulate a skipped-dependent pin after a crates.io publish.
+              echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -138,7 +169,29 @@ jobs:
             esac
           done <<< "$changed"
 
+          # Broad test-relevant filter (the paths that formerly gated the whole
+          # workflow on pull_request). Every config-relevant change also needs
+          # the build archive consumed by zakura-config, so `config` implies
+          # `rust` even for paths outside the old workflow-level filter.
+          if [[ "$config" == "true" ]] || \
+             grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
+            rust=true
+          else
+            rust=false
+          fi
+
+          # Semver-checks cannot see a dependency major underneath unchanged
+          # type names. This path set is what can introduce a skipped crate
+          # whose index manifest still pins the old major.
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^scripts/check-crate-publish-graph\.sh$|^scripts/lib/crates-index\.sh$|^\.github/workflows/tests-unit\.yml$' <<< "$changed"; then
+            publish_graph=true
+          else
+            publish_graph=false
+          fi
+
           echo "config=$config" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "publish_graph=$publish_graph" >> "$GITHUB_OUTPUT"
 
   # Compile the whole workspace and every test binary ONCE, then hand the result
   # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
@@ -149,6 +202,12 @@ jobs:
   # parallel test execution across the shard jobs.
   build-tests:
     name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || (github.event_name == 'schedule' && 'release' || 'ci-tests') }})
+    needs: changes
+    # Run for pushes (own paths filter), the merge queue, nightly, and on demand;
+    # on a pull request only when a test-relevant path changed. unit-tests and
+    # zakura-config `need` this job, so they cascade-skip with it on PRs that
+    # touch no test-relevant paths.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -168,7 +227,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -179,11 +238,11 @@ jobs:
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            cargo nextest archive --locked --release --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           elif [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
-            cargo nextest archive --locked --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
@@ -224,7 +283,7 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -265,7 +324,7 @@ jobs:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -277,8 +336,38 @@ jobs:
       - name: Check generated zakurad config compatibility
         run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
+  nu7-experimental:
+    name: Experimental NU7 feature tests
+    needs: changes
+    # Compiles its own binaries, because the shared nextest archive is built
+    # without this feature.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Test experimental NU7 builds
+        run: |
+          cargo test --locked --features nu7-experimental \
+            -p zakura-consensus --lib
+          cargo check --locked -p zakura --features nu7-experimental
+
   network-dependent:
     name: network-dependent acceptance tests
+    needs: changes
+    # Compiles independently of build-tests, so gate it directly on the same
+    # test-relevant filter; always runs on non-PR events.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -295,7 +384,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -324,7 +413,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -349,12 +438,44 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
       - name: Check no git dependencies
         run: cargo nextest run --profile check-no-git-dependencies --locked --run-ignored=only
+
+  # Semver-checks compares rustdoc APIs and cannot see a dependency's major
+  # bump underneath an unchanged type name. This job is the gate that can:
+  # it dry-run-publishes the real publish set against the live crates.io
+  # index, so a skipped dependent whose index manifest still pins the old
+  # major fails here instead of accumulating on main. It lives in this
+  # workflow because only `test success` is globally required.
+  publish-graph:
+    name: crates.io publish graph
+    needs: changes
+    # Path-gated on PRs and pushes. Always runs in the merge queue and
+    # nightly so a docs-only merge cannot land on top of a broken graph.
+    if: >
+      needs.changes.outputs.publish_graph == 'true'
+      || github.event_name == 'merge_group'
+      || github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          # Packages crates with --no-verify; does not compile them.
+          cache: false
+      - name: Check crates.io publish graph
+        run: ./scripts/check-crate-publish-graph.sh
 
   # NOTE: the Zakura regtest e2e jobs moved to `zakura-e2e.yml` so they can be
   # path-gated independently of the broad Rust filter here (they run on
@@ -369,18 +490,25 @@ jobs:
       - build-tests
       - unit-tests
       - zakura-config
+      - nu7-experimental
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
+      - publish-graph
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 #v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
-          # These jobs are skipped outside their event or changed-path scope.
+          # These jobs are skipped outside their event or changed-path scope:
+          # build-tests / unit-tests / network-dependent skip on pull requests
+          # that touch no test-relevant paths (unit-tests and zakura-config
+          # cascade-skip with build-tests), pruned-storage is push-main only,
+          # check-no-git-dependencies is A-release-label only, publish-graph
+          # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7-experimental, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

@@ -27,7 +27,7 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, router::RouterError, transaction};
 use zakura_network::{
-    canonical_peer_addr, connect_isolated_tcp_direct_with_inbound,
+    canonical_peer_addr, connect_isolated_with_inbound,
     types::{InventoryHash, PeerServices},
     CacheDir, Config as NetworkConfig, InventoryResponse, P2pStack, PeerError, PeerSource, Request,
     Response, SharedPeerError,
@@ -806,7 +806,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
 
     let missing_tx_id = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
 
-    let txs = [missing_tx_id, repeated_tx.id];
+    let txs = [missing_tx_id, repeated_tx.id()];
 
     // Send a request via the peer set, via a local TCP connection,
     // to the isolated peer's `repeated_response` inbound service
@@ -962,11 +962,14 @@ async fn setup(
 
     // State
     // UTXO verification doesn't matter for these tests.
-    let (state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zakura_state::init(state_config, &network, Height::MAX, 0).await;
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        zakura_state::init(state_config, &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
+    let identity_dir = tempfile::tempdir().expect("temporary network identity directory");
     let network_config = NetworkConfig {
         network: network.clone(),
         listen_addr: config_listen_addr,
@@ -975,10 +978,16 @@ async fn setup(
         initial_mainnet_peers: IndexSet::new(),
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
+        identity_dir: identity_dir.path().to_path_buf(),
 
         // Optionally run the Zakura P2P-v2 endpoint alongside the legacy TCP
         // stack so the dual-stack wiring is exercised (coexistence tests).
         p2p_stack,
+        zakura: zakura_network::zakura::ZakuraConfig {
+            listen_addr: Some(config_listen_addr),
+            bootstrap_peers: Vec::new(),
+            ..Default::default()
+        },
 
         ..NetworkConfig::default()
     };
@@ -1028,6 +1037,7 @@ async fn setup(
         false,
         peer_set.clone(),
         state_service.clone(),
+        tower::util::BoxCloneService::new(read_only_state_service),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1083,9 +1093,12 @@ async fn setup(
     let user_agent = "test".to_string();
 
     // Open a fake peer connection to the inbound listener, using the isolated connection API
-    let connected_peer_service = connect_isolated_tcp_direct_with_inbound(
+    let isolated_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("local listener connection succeeds");
+    let connected_peer_service = connect_isolated_with_inbound(
         &network,
-        listen_addr,
+        isolated_stream,
         user_agent,
         response_inbound_service,
     )
@@ -1124,7 +1137,7 @@ async fn setup(
 mod submitblock_test {
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
-    use zakura_rpc::SubmitBlockChannel;
+    use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 
     use super::*;
 
@@ -1153,7 +1166,9 @@ mod submitblock_test {
         // State
         let state_config = StateConfig::ephemeral();
         let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0).await;
+            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
+                .await
+                .expect("ephemeral state initialization succeeds");
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 
@@ -1193,8 +1208,10 @@ mod submitblock_test {
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send((block::Hash([1; 32]), block::Height(1)))
-            .await
+            .send(MinedBlockEvent::Committed {
+                hash: block::Hash([1; 32]),
+                height: block::Height(1),
+            })
             .unwrap();
         let gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(
@@ -1214,7 +1231,7 @@ mod submitblock_test {
                 let sent_mined_block = {
                     let captured_logs = logs.lock().unwrap();
                     String::from_utf8_lossy(&captured_logs)
-                        .contains("sending mined block broadcast")
+                        .contains("sending committed mined block broadcast")
                 };
 
                 if sent_mined_block {
@@ -1234,7 +1251,7 @@ mod submitblock_test {
         };
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending mined block broadcast"));
+        assert!(log_output.contains("sending committed mined block broadcast"));
 
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle

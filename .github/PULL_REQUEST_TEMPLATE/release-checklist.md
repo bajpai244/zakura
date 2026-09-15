@@ -17,20 +17,20 @@ For performance and security, every release should carry a current Mainnet check
 - [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
 - [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).
 
-# Missed Dependency Updates
+# Curated Dependency Updates
 
-Sometimes `dependabot` misses some dependency updates, or we accidentally turned them off.
+Routine Cargo version updates are intentionally disabled. Do not run a blanket
+`cargo update` during release preparation: it can introduce a large cargo-vet
+evidence backlog without a release-specific justification.
 
-This step can be skipped if there is a large pending dependency upgrade. (For example, shared ECC crates.)
-
-Here's how we make sure we got everything:
-
-- [ ] Run `cargo update` on the latest `main` branch, and keep the output
-- [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, add duplicate dependency exceptions to `deny.toml`.
-- [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
-- [ ] Open a separate PR with the changes
-- [ ] Add the output of `cargo update` to that PR as a comment
+- [ ] Review open Dependabot security alerts and focused dependency updates
+      already planned for this release.
+- [ ] If an update is needed, open a separate focused PR from the latest `main`.
+- [ ] Restrict the update to the required crate or dependency family, and include
+      the update command and output in the PR.
+- [ ] Confirm cargo-vet evidence covers the update and run targeted runtime tests.
+- [ ] Update duplicate dependency exceptions in `deny.toml` only as required by
+      the focused resolution change.
 
 # Summarise Release Changes
 
@@ -141,7 +141,10 @@ The preparation workflow rejects a requested tag below the conservative
 release level implied by the pending changelog: `Added`, `Changed`,
 `Deprecated`, or `Removed` entries require at least a minor release; a
 Mainnet network upgrade requires a major release; otherwise the floor is a
-patch release. It never silently changes the requested tag.
+patch release. The documented, explained `allow-patch` waiver can lower
+backwards-compatible `Added` and `Changed` entries to the patch floor without
+changing independently required library crate bumps. It never silently changes
+the requested tag.
 
 - [ ] Generate and commit the stored config for the new version — the
       `last_config_is_stored` acceptance test derives the expected filename
@@ -178,18 +181,20 @@ Check that the release will work:
       crates are not bumped or published.
 - [ ] Confirm the crates.io publish graph resolves at workspace versions
       (`./scripts/check-crate-publish-graph.sh`, step 5 of `make
-      pre-release`): crates already published at their workspace version are
-      skipped at publish time, and dependents resolve their index manifests.
-      A pinned prerelease fails resolution; a pinned old major resolves as a
-      silent duplicate — the check asserts on each packaged archive's
-      Cargo.lock to catch both. Any prerelease bump (and any new major)
-      forces a "cascade" republish of its dependent closure —
-      `prepare-release.sh` plans these automatically; review its `cascade`
-      rows and do not drop them. For a deliberately GitHub-only release
-      candidate, the documented override is
-      `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` locally and the
-      `allow_unpublishable_crate_graph` input on the Create release workflow;
-      note it in the release PR and do not publish crates.
+      pre-release`). PR CI already runs this as the `crates.io publish
+      graph` job on every Cargo.toml change and in the merge queue; this
+      step is the release-time confirmation. Crates already published at
+      their workspace version are skipped at publish time, and dependents
+      resolve their index manifests. A pinned prerelease fails resolution;
+      a pinned old major resolves as a silent duplicate — the check
+      asserts on each packaged archive's Cargo.lock to catch both. Any
+      prerelease bump (and any new major) forces a "cascade" republish of
+      its dependent closure — `prepare-release.sh` plans these
+      automatically; review its `cascade` rows and do not drop them. For a
+      deliberately GitHub-only release candidate, the documented override
+      is `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` locally and the
+      `allow_unpublishable_crate_graph` input on the Create release
+      workflow; note it in the release PR and do not publish crates.
 - [ ] Update (or install) `semver-checks`: `cargo +stable install cargo-semver-checks --locked`
 - [ ] Confirm the preparation workflow's `cargo public-api diff latest` reports
       completed successfully for every changed library being published.
@@ -315,20 +320,25 @@ from publication until deletion.
 
 ## Publish Crates
 
-- [ ] [Run `cargo login`](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio)
-- [ ] It is recommended that the following step be run from a fresh checkout of
-      the repo, to avoid accidentally publishing files like e.g. logs that might
-      be lingering around
-- [ ] Publish the crates to crates.io; edit the list to only include the crates that
-      have been changed, but keep their overall order:
+CI publishes the crates from the tagged commit using crates.io Trusted
+Publishing. There is no `cargo login`, no local publish loop, and no crate list
+to edit: the set comes from `cargo metadata` filtered against the live index,
+so only crates whose workspace version is absent are uploaded. See
+[`docs/release-tag-protection.md`](https://github.com/zakura-core/zakura/blob/main/docs/release-tag-protection.md).
 
-```
-for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute -p $c; done
-```
-
-- [ ] Check that Zakura can be installed from `crates.io`:
-      `cargo install --locked --force --version <version> zakura && ~/.cargo/bin/zakurad`
-      and put the output in a comment on the PR.
+- [ ] Confirm `Create release` dispatched `Publish crates` for this tag. It
+      does so automatically for a stable tag; for a release candidate, dispatch
+      it by hand from `main` with `mode: publish` once the decision to publish
+      has been made.
+- [ ] Review the crate/version/status table in that run's summary, then have a
+      `crates-io` environment reviewer approve the deployment. Approving is
+      irreversible — a published version can be yanked, never replaced.
+- [ ] Confirm `Verify the published versions` and `Install zakurad from
+      crates.io` pass, and put the reported `zakurad --version` in a comment on
+      the PR.
+- [ ] If the publish failed partway through, dispatch `Publish crates` again
+      for the same tag: the plan skips whatever landed and publishes the rest.
+      Never repair a partial publish by yanking and re-uploading a version.
 
 ## Publish Docker Images
 

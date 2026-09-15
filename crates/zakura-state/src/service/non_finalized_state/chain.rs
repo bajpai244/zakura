@@ -9,7 +9,6 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use mset::MultiSet;
 use tracing::instrument;
 
 use zakura_chain::{
@@ -33,6 +32,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
     work::difficulty::PartialCumulativeWork,
 };
+use zakura_header_chain::{ChainScore, SuffixWork};
 
 use crate::{
     request::Treestate, service::check, ContextuallyVerifiedBlock, HashOrHeight, OutputLocation,
@@ -42,8 +42,9 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
-use self::index::TransparentTransfers;
+use self::{counted_set::CountedSet, index::TransparentTransfers};
 
+mod counted_set;
 pub mod index;
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
@@ -165,7 +166,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sprout_anchors: MultiSet<sprout::tree::Root>,
+    pub(crate) sprout_anchors: CountedSet<sprout::tree::Root>,
     /// The Sprout anchors created by each block in `blocks`.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
@@ -176,7 +177,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sapling_anchors: MultiSet<sapling::tree::Root>,
+    pub(crate) sapling_anchors: CountedSet<sapling::tree::Root>,
     /// The Sapling anchors created by each block in `blocks`.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
@@ -190,7 +191,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) orchard_anchors: MultiSet<orchard::tree::Root>,
+    pub(crate) orchard_anchors: CountedSet<orchard::tree::Root>,
     /// The Orchard anchors created by each block in `blocks`.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
@@ -208,7 +209,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) ironwood_anchors: MultiSet<ironwood::tree::Root>,
+    pub(crate) ironwood_anchors: CountedSet<ironwood::tree::Root>,
 
     /// The Ironwood anchors created by each block in `blocks`.
     ///
@@ -277,19 +278,19 @@ impl Chain {
             tx_loc_by_hash: Default::default(),
             created_utxos: Default::default(),
             spent_utxos: Default::default(),
-            sprout_anchors: MultiSet::new(),
+            sprout_anchors: CountedSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
             sprout_trees_by_height: Default::default(),
-            sapling_anchors: MultiSet::new(),
+            sapling_anchors: CountedSet::new(),
             sapling_anchors_by_height: Default::default(),
             sapling_trees_by_height: Default::default(),
             sapling_subtrees: Default::default(),
-            orchard_anchors: MultiSet::new(),
+            orchard_anchors: CountedSet::new(),
             orchard_anchors_by_height: Default::default(),
             orchard_trees_by_height: Default::default(),
             orchard_subtrees: Default::default(),
-            ironwood_anchors: MultiSet::new(),
+            ironwood_anchors: CountedSet::new(),
             ironwood_anchors_by_height: Default::default(),
             ironwood_trees_by_height: Default::default(),
             ironwood_subtrees: Default::default(),
@@ -1770,11 +1771,23 @@ impl Chain {
             contextually_valid.block.as_ref(),
             contextually_valid.hash,
             contextually_valid.height,
-            &contextually_valid.new_outputs,
-            &contextually_valid.spent_outputs,
+            contextually_valid.new_outputs.as_ref(),
+            contextually_valid.spent_outputs.as_ref(),
             &contextually_valid.transaction_hashes,
             &contextually_valid.chain_value_pool_change,
         );
+
+        let block_work = block
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("work has already been validated");
+        let partial_cumulative_work = self.partial_cumulative_work.checked_add(block_work).ok_or(
+            ValidateContextError::CumulativeWorkOverflow {
+                height,
+                block_hash: hash,
+            },
+        )?;
 
         // add hash to height_by_hash
         let prior_height = self.height_by_hash.insert(hash, height);
@@ -1784,12 +1797,7 @@ impl Chain {
         );
 
         // add work to partial cumulative work
-        let block_work = block
-            .header
-            .difficulty_threshold
-            .to_work()
-            .expect("work has already been validated");
-        self.partial_cumulative_work += block_work;
+        self.partial_cumulative_work = partial_cumulative_work;
 
         // for each transaction in block
         for (transaction_index, (transaction, transaction_hash)) in block
@@ -1982,8 +1990,8 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             contextually_valid.block.as_ref(),
             contextually_valid.hash,
             contextually_valid.height,
-            &contextually_valid.new_outputs,
-            &contextually_valid.spent_outputs,
+            contextually_valid.new_outputs.as_ref(),
+            contextually_valid.spent_outputs.as_ref(),
             &contextually_valid.transaction_hashes,
             &contextually_valid.chain_value_pool_change,
         );
@@ -2649,28 +2657,19 @@ impl Ord for Chain {
     /// [1]: super::NonFinalizedState
     /// [2]: super::NonFinalizedState::chain_set
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.partial_cumulative_work != other.partial_cumulative_work {
-            self.partial_cumulative_work
-                .cmp(&other.partial_cumulative_work)
-        } else {
-            let self_hash = self
+        let score = |chain: &Self| {
+            let tip = chain
                 .blocks
                 .values()
                 .last()
-                .expect("always at least 1 element")
+                .expect("a non-finalized chain always contains a block")
                 .hash;
-
-            let other_hash = other
-                .blocks
-                .values()
-                .last()
-                .expect("always at least 1 element")
-                .hash;
-
-            // This comparison is a tie-breaker within the local node, so it does not need to
-            // be consistent with the ordering on `ExpandedDifficulty` and `block::Hash`.
-            self_hash.0.cmp(&other_hash.0)
-        }
+            ChainScore::new(
+                SuffixWork::new(chain.partial_cumulative_work.as_u256()),
+                tip,
+            )
+        };
+        score(self).cmp(&score(other))
     }
 }
 

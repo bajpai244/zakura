@@ -1,6 +1,6 @@
 use super::super::trace::{
     block_sync_message_label, elapsed_us, height as trace_height, peer as trace_peer,
-    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64, QueueSendFailedEvent,
+    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
 };
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
@@ -67,6 +67,7 @@ impl PeerRoutine {
         let unreceived_count = u64::try_from(unreceived_count).unwrap_or(u64::MAX);
         if outcome.missing_count == 0
             && outcome.released_count == 0
+            && outcome.committed_count == 0
             && outcome.returned_count == unreceived_count
         {
             return;
@@ -86,12 +87,16 @@ impl PeerRoutine {
     /// The reason plus the live slot/budget/work snapshot let a trace tell a legitimate
     /// idle (`no_work` with an empty queue, `cwnd_saturated`) from a recoverable one
     /// (slots + budget + work all free yet stopped — a wakeup gap to fix).
-    pub(super) fn trace_fill_stop(&self, reason: &'static str) {
+    pub(super) fn trace_fill_stop(&mut self, reason: &'static str) {
+        let now = Instant::now();
+        if !fill_stop_trace_due(self.fill_stop_trace_at.get(reason).copied(), now) {
+            return;
+        }
+        self.fill_stop_trace_at.insert(reason, now);
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
             // Mirror the effective (reliability-scaled) bypass the fill loop used.
             let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
-            let now = Instant::now();
             row.peer = Some(trace_peer(&self.peer));
             row.fill_stop_reason = Some(reason);
             row.fill_sent = Some(0);
@@ -102,18 +107,6 @@ impl PeerRoutine {
             row.budget_available = Some(self.budget.available());
             row.pending_work = Some(saturating_usize(self.work.pending_len()));
             row.received_status = Some(BoolOrU64::U64(u64::from(self.received_status)));
-        });
-    }
-
-    pub(super) fn trace_queue_send_failed(&self, msg: &BlockSyncMessage, error: &OrderedSendError) {
-        self.trace.emit_event(|| {
-            QueueSendFailedEvent::peer_routine(
-                &self.peer,
-                msg,
-                error,
-                self.session.outbound_capacity(),
-                self.session.outbound_max_capacity(),
-            )
         });
     }
 
@@ -284,6 +277,7 @@ impl PeerRoutine {
 fn insert_work_return_outcome(row: &mut BlockTraceFields, outcome: WorkReturnOutcome) {
     row.released_bytes = Some(outcome.released_bytes);
     row.returned_count = Some(outcome.returned_count);
+    row.committed_count = Some(outcome.committed_count);
     row.already_pending_count = Some(outcome.already_pending_count);
     row.released_count = Some(outcome.released_count);
     row.missing_count = Some(outcome.missing_count);
